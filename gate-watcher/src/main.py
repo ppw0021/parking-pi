@@ -55,6 +55,8 @@ Changed:
  - main(...):
  -- check_timeout(...)
 v0.0.8: Removing piHat
+ - Adding LEDs, Buttons and Servos
+
 '''
 import requests
 # import servo  # servo.py
@@ -169,9 +171,10 @@ def set_gate(gate_id: int, close: bool):
 
 # ---- Configuration ---------------------------------------------------------
 # Replace with your target IP (and include http:// or https://)
-url = "http://127.0.0.1:5000"
+# url = "http://127.0.0.1:5000"
+# url = "http://172.20.10.7:5000"
 CAMERA_INDEX = 0  # Ususaly '0' for the first connected camera
-WEB_PI_IP = "http://127.0.0.1"  # Holds the IP of the web server pi
+WEB_PI_IP = "http://10.138.63.88"  # Holds the IP of the web server pi
 URL = f"{WEB_PI_IP}:5000"  # Holds the full address of the server
 ASPECT_MIN = 2.0 #
 ASPECT_MAX = 6.0 #
@@ -194,8 +197,8 @@ MIN_FINAL_LEN   = (6, 6) # Allowed length range for acceptable string
 MIN_FINAL_SAMPLES = 2    # Need >=2 valid readings
 
 # Image processing
-AREA_MIN  = 2000
-AREA_MAX  = 5000
+AREA_MIN  = 4000
+AREA_MAX  = 7000
 AREA_STEP = 1000
 AREA_ABS_MIN = 200
 area_min  = AREA_MIN
@@ -324,24 +327,43 @@ def read_gpio_state():
     Methods: GPIO.input() with pull-ups; LOW means grounded/active.
     Creates: two bools.
     """
-    enter_low = (GPIO.input(PIN_ENTER) == GPIO.LOW)
-    exit_low  = (GPIO.input(PIN_EXIT)  == GPIO.LOW)
-    return enter_low, exit_low
+    enter_high = (GPIO.input(ENTRY_BUTTON_PIN) == GPIO.HIGH)
+    exit_high  = (GPIO.input(EXIT_BUTTON_PIN)  == GPIO.HIGH)
+    return enter_high, exit_high
 
-def force_mode(new_mode):
-    """
-    Function: force_mode
-    Purpose: Deterministically set scan_mode, clear aggregators on change.
-    Methods: Assign 'scan_mode' and reset aggr_left/aggr_right.
-    Creates: updates global scan_mode; prints mode banner.
-    """
-    global scan_mode, aggr_left, aggr_right
-    if scan_mode != new_mode:
-        scan_mode = new_mode
-        clear_aggr(aggr_left)
-        clear_aggr(aggr_right)
-        print(f"Scan mode: "
-              f"{scan_mode.upper() if scan_mode!='idle' else 'IDLE'}")
+def led_set(led_side, led_color, delay):
+    '''
+        Function: led_set
+        Purpose: Turn LEDs on/off
+        Methods: GPIO.output
+        Creates: Nothing
+    '''
+    if led_side == 'enter':
+        GPIO.output(ENTRY_LED_PINS[led_color], GPIO.HIGH)
+        if delay:
+            time.slep(delay)
+            return
+    if led_side == 'exit':
+        GPIO.output(ENTRY_LED_PINS[led_color], GPIO.HIGH)
+        if delay:
+            time.slep(delay)
+            return
+
+
+# def force_mode(new_mode):
+#     """
+#     Function: force_mode
+#     Purpose: Deterministically set scan_mode, clear aggregators on change.
+#     Methods: Assign 'scan_mode' and reset aggr_left/aggr_right.
+#     Creates: updates global scan_mode; prints mode banner.
+#     """
+#     global scan_mode, aggr_left, aggr_right
+#     if scan_mode != new_mode:
+#         scan_mode = new_mode
+#         clear_aggr(aggr_left)
+#         clear_aggr(aggr_right)
+#         print(f"Scan mode: "
+#               f"{scan_mode.upper() if scan_mode!='idle' else 'IDLE'}")
 
 
 # ---------------- Image preprocessing and OCR -------------------------------
@@ -353,7 +375,7 @@ def set_brightness(value):
     subprocess.call([
         "v4l2-ctl", "--device=/dev/video0", "--set-ctrl", f"brightness={value}"
     ])
-    print(f"Яркость: {value}")
+    print(f"Brightness: {value}")
     return value
 
 def set_contrast(value):
@@ -361,7 +383,7 @@ def set_contrast(value):
     subprocess.call([
         "v4l2-ctl", "--device=/dev/video0", "--set-ctrl", f"contrast={value}"
     ])
-    print(f"Контраст: {value}")
+    print(f"Contrast: {value}")
     return value
 
 def set_gain(value):
@@ -695,12 +717,12 @@ def draw_zones(vis):
     # semi-transparent shading for zones
     overlay = vis.copy()
     # left (exit) zone in cyan-ish
-    cv2.rectangle(overlay, (0, 0), (x_exit, h), (255, 255, 0), -1)
+    # cv2.rectangle(overlay, (0, 0), (x_exit, h), (255, 255, 0), -1)
     # right (enter) zone in green-ish
-    cv2.rectangle(overlay, (x_enter, 0), (w, h), (0, 255, 0), -1)
+    # cv2.rectangle(overlay, (x_enter, 0), (w, h), (0, 255, 0), -1)
     # blend
     alpha = 0.15
-    cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0, vis)
+    # cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0, vis)
 
     # draw the vertical boundary lines
     cv2.line(vis, (x_exit, 0), (x_exit, h), (0, 255, 255), 2)
@@ -716,6 +738,65 @@ def draw_zones(vis):
         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA
     )
 
+def draw_box_with_area(vis, box, color=(0, 255, 0)):
+    """
+    Function: draw_box_with_area
+    Purpose: Draw a bbox and overlay two area labels:
+             S = estimated largest contour area inside the ROI
+             A = bbox area (w*h)
+             Works with 4-tuple (x,y,w,h) and ignores extra fields.
+    Methods: Slice box[:4]; draw rectangle; compute bbox area; convert
+             ROI to gray; bilateral filter; Otsu BIN_INV; small opening;
+             find external contours; take max cv2.contourArea(...);
+             draw solid bg and put text.
+    Creates: local vars: x,y,w,h, bbox_area, contour_area, label.
+    """
+    # geometry (safe for 4- or longer tuples)
+    x, y, w, h = box[:4]
+
+    # draw rectangle
+    cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
+
+    # bbox area (screen metric)
+    bbox_area = int(w) * int(h)
+
+    # --- approximate contour area inside ROI ---
+    roi = vis[y:y + h, x:x + w]
+    if roi.size > 0:
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        # denoise a bit; keep edges; help Otsu separate dark glyphs
+        filt = cv2.bilateralFilter(gray, 7, 25, 25)
+        # invert so dark text -> white blobs; Otsu for auto-threshold
+        _, bin_inv = cv2.threshold(
+            filt, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )
+        # remove tiny speckles
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        clean = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, k, iterations=1)
+        cnts, _ = cv2.findContours(
+            clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        contour_area = max((cv2.contourArea(c) for c in cnts), default=0)
+    else:
+        contour_area = 0
+
+    # compose label: contour (S) + bbox (A)
+    label = f"S={int(contour_area)}  A={bbox_area}"
+
+    # text settings
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale, thick = 0.5, 2
+    (tw, th), base = cv2.getTextSize(label, font, scale, thick)
+
+    # place near top-left corner of the box
+    tx = x + 4
+    ty = max(y + th + 4, th + 4)
+
+    # solid background for readability
+    cv2.rectangle(vis, (tx - 2, ty - th - 2), (tx + tw + 2, ty + 2),
+                  (0, 0, 0), -1)
+    cv2.putText(vis, label, (tx, ty), font, scale,
+                (0, 255, 255), thick, cv2.LINE_AA)
 
 # -------------------- Server interaction -----------------------------------
 def send_plate_event(plate, x, frame_width):
@@ -747,19 +828,34 @@ def send_plate_event(plate, x, frame_width):
             # (210: added | 211: already exists | 213: error or invalid)
             if code == 210:
                 print("Enter: plate added, open gate.")
-                # servo.set_gate(0, False)  # optionally open entry
+                led_set(op,0,0.01) # Blue LED off
+                led_set(op,1,1)    # Green LED on
+                set_gate(0, False) # Open gate
+                time.sleep(3)      # Wait for 3 seconds
+                set_gate(0, True)  # Close gate
+                led_set(op,1,0.01) # Green LED off
+                
             elif code == 211:
                 print("Enter: already exists, do not open gate.")
+                led_set(op,2,2)    # Red LED on for 2 second
             elif code == 213:
                 print("Enter: invalid plate format or server error.")
+                led_set(op,2,2)    # Red LED on for 2 second
             else:
                 print(f"Enter: unexpected status {code}")
+                led_set(op,2,2)    # Red LED on for 2 second
 
         else:  # op == 'exit'
             # (210: paid, exit allowed | 211: not paid | 212: not found | 213: error)
             if code == 210:
                 print("Exit: paid up, exit permitted, open gate.")
-                # servo.set_gate(1, False)  # optionally open exit
+                led_set(op,0,0.01) # Blue LED off
+                led_set(op,1,0)    # Green LED on
+                set_gate(0, False) # Open gate
+                time.sleep(3)      # Wait for 3 seconds
+                set_gate(0, True) # Close gate
+                led_set(op,1,0.01)    # Green LED off
+                
             elif code == 211:
                 print("Exit: NOT paid, keep gate closed.")
             elif code == 212:
@@ -825,6 +921,7 @@ def toggle_mode(new_mode):
     clear_aggr(aggr_left)
     clear_aggr(aggr_right)
     print(f"Scan mode: {scan_mode.upper() if scan_mode!='idle' else 'IDLE'}")
+    time.sleep(0.5)
 
 # ----------------------------- Main Loop -----------------------------------
 def main():
@@ -862,8 +959,8 @@ def main():
     prev_state = (None, None)
 
     # Camera picture settings
-    brightness = 58
-    contrast = 148
+    brightness = 130
+    contrast = 170
     gain = 128
 
     # OCR area settings
@@ -877,14 +974,15 @@ def main():
                 continue
 
             # Read GPIO and show arrows; set mode with EXIT priority
-            enter_low, exit_low = read_gpio_state()
-            # show_arrows(sense, enter_low, exit_low)
-            if exit_low:
-                force_mode('exit')
-            elif enter_low:
-                force_mode('enter')
+            enter_high, exit_high = read_gpio_state()
+            # show_arrows(sense, enter_high, exit_high)
+            if exit_high:
+                toggle_mode('exit')
+            elif enter_high:
+                toggle_mode('enter')
             else:
-                force_mode('idle')
+                time.sleep(0.02)  # Do nothing
+                # toggle_mode('idle')
 
             boxes = find_plate_candidates(frame)
             best_left, best_right = pick_best_by_side(
@@ -897,6 +995,7 @@ def main():
                 next_read_ts = now + READ_PERIOD
 
                 if scan_mode == 'exit' and best_left:
+                    led_set('exit',2,0)
                     p, conf, px = ocr_bbox(frame, best_left)
                     if p:
                         update_streak(aggr_left, p, px)
@@ -904,6 +1003,7 @@ def main():
                     maybe_finalize(aggr_left, frame.shape[1])
 
                 if scan_mode == 'enter' and best_right:
+                    led_set('enter',2,0)
                     p, conf, px = ocr_bbox(frame, best_right)
                     if p:
                         update_streak(aggr_right, p, px)
@@ -915,7 +1015,8 @@ def main():
             if show_zones:
                 draw_zones(vis)
             for (x, y, w, h) in boxes:
-                cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                draw_box_with_area(vis, (x, y, w, h))
+                # cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
             # HUD: show current scan mode
             hud = "MODE: "
