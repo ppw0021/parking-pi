@@ -13,13 +13,9 @@ from time import sleep
 
 ENTRY_PIN = 16  # physical pin 16
 EXIT_PIN = 18
-FREQ = 50  # 50 Hz for servo
 
 def set_gate(gate_id: int, close: bool):
-    """
-    Move a servo connected to PIN to the specified angle (0–180°),
-    then stop and clean up GPIO.
-    """
+    FREQ = 50  # 50 Hz for servo
     PIN = 0
     if gate_id == 0:
         PIN = ENTRY_PIN
@@ -62,10 +58,10 @@ def set_gate(gate_id: int, close: bool):
 # Example usage:
 
 # Open Gates
-set_gate(0, False)
-set_gate(1, False)
+set_gate(0, False)  # Open gate 0 (Entry gate)
+set_gate(1, False)  # Open gate 1 (Exit gate)
 sleep(1)
 
 #Close Gates
-set_gate(0, True)
-set_gate(1, True)
+set_gate(0, True)   # Close gate 0 (Entry gate)
+set_gate(1, True)   # Close gate 1 (Exit gate)
