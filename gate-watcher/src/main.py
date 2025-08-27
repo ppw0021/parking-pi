@@ -1,5 +1,5 @@
 '''
-GateWatcher v0.0.7 (20251016-1550):
+GateWatcher v0.0.8 (20251018-1250):
 The code monitors the gates of a parking lot.
 If a license plate is detected on the right part of the creen,
 It means a car is entering, so the code will issue a call to the server:
@@ -54,10 +54,10 @@ Changed:
  - handle_candidate(...)
  - main(...):
  -- check_timeout(...)
-
+v0.0.8: Removing piHat
 '''
 import requests
-import servo  # servo.py
+# import servo  # servo.py
 from time import sleep
 import cv2
 import numpy as np
@@ -66,19 +66,106 @@ from pytesseract import Output
 import time
 from datetime import datetime
 import re
+import RPi.GPIO as GPIO
 
+# Needed for Servo, LEDs, and Buttons
+GPIO.setmode(GPIO.BCM)
+'''
+Entry pinout
+13 = red
+6 = green
+5 = blue
+19 = entry button
+
+Exit pintout
+9 = red
+0 = green
+11 = blue
+10 = exit button
+'''
+ENTRY_LED_PINS = [13, 6, 5]
+EXIT_LED_PINS = [9, 0, 11]
+ENTRY_BUTTON_PIN = 19
+EXIT_BUTTON_PIN = 10
+SERVO_ENTRY_PIN = 23  # physical pin 16
+SERVO_EXIT_PIN = 24 # physical pin 
+
+# Setup button pins
+GPIO.setup(ENTRY_BUTTON_PIN, GPIO.IN)
+GPIO.setup(EXIT_BUTTON_PIN, GPIO.IN)
+
+# Setup LED pins
+for pin in ENTRY_LED_PINS:
+    GPIO.setup(pin, GPIO.OUT)
+for pin in EXIT_LED_PINS:
+    GPIO.setup(pin, GPIO.OUT)
+
+# Setup servo
+GPIO.setup(SERVO_ENTRY_PIN, GPIO.OUT)
+GPIO.setup(SERVO_EXIT_PIN, GPIO.OUT)
+
+# Set gate, 0 is entrance, 1 is exit, True is closed, False is open
+def set_gate(gate_id: int, close: bool):
+    FREQ = 50  # 50 Hz for servo
+    PIN = 0
+    if gate_id == 0:
+        PIN = SERVO_ENTRY_PIN
+    elif gate_id == 1:
+        PIN = SERVO_EXIT_PIN
+    else:
+        return
+
+    if close:
+        # Close
+        angle = 0
+
+    else:
+        # Open
+        if gate_id == 0:
+            angle = 70
+        else:
+            angle = 90
+
+    # Safety clamp
+    angle = max(0, min(180, angle))
+
+    # Convert angle to duty cycle (approximate for SG90)
+    duty = 2.5 + (angle / 18.0)  # maps 0–180° to ~2.5–12.5% duty
+
+    # GPIO.setmode(GPIO.BOARD)
+    GPIO.setwarnings(False)
+
+    pwm = GPIO.PWM(PIN, FREQ)
+    pwm.start(0)
+
+    try:
+        pwm.ChangeDutyCycle(duty)
+        sleep(0.7)  # wait for the servo to reach position
+    finally:
+        pwm.stop()
+        # GPIO.cleanup()
+
+    print(f"Moved servo to {angle}° (duty cycle {duty:.2f}%)")
 
 # --- NEW: GPIO + Sense HAT --------------------------------------------------
-import RPi.GPIO as GPIO
-from sense_hat import SenseHat
-
 # Open Gates
-# servo.set_gate(0, False) # Open gate 0 (Entry gate)
-# servo.set_gate(1, False) # Open gate 1 (Exit gate)
+# set_gate(0, False) # Open gate 0 (Entry gate)
+# set_gate(1, False) # Open gate 1 (Exit gate)
 # sleep(1)
+#
 # Close Gates
-# servo.set_gate(0, True)  # Close gate 0 (Entry gate)
-# servo.set_gate(1, True)  # Close gate 1 (Exit gate)
+# set_gate(0, True)  # Close gate 0 (Entry gate)
+# set_gate(1, True)  # Close gate 1 (Exit gate)
+#
+# Set LED 0=red, 1=blue, 2=green, GPIO.HIGH is on, GPIO.LOW is off
+# GPIO.output(ENTRY_LED_PINS[0], GPIO.HIGH)
+#
+# Check button for entry
+# if GPIO.input(ENTRY_BUTTON_PIN) == GPIO.HIGH:
+#
+# Check button for exit
+# if GPIO.input(EXIT_BUTTON_PIN) == GPIO.HIGH:
+
 
 # ---- Configuration ---------------------------------------------------------
 # Replace with your target IP (and include http:// or https://)
@@ -752,8 +839,8 @@ def main():
     global next_read_ts, scan_mode, show_zones
 
     # Init Sense HAT and GPIO
-    sense = SenseHat()
-    sense.clear()
+    # sense = SenseHat()
+    # sense.clear()
 
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(PIN_ENTER, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -765,7 +852,7 @@ def main():
     if not cap.isOpened():
         print("ERROR: Cannot open USB camera!")
         GPIO.cleanup()
-        sense.clear()
+        # sense.clear()
         return
 
     print("Press 'e' ENTER-only, 'x' EXIT-only, 's' snapshot, 'z' toggle zones, 'q' quit.")
@@ -791,7 +878,7 @@ def main():
 
             # Read GPIO and show arrows; set mode with EXIT priority
             enter_low, exit_low = read_gpio_state()
-            show_arrows(sense, enter_low, exit_low)
+            # show_arrows(sense, enter_low, exit_low)
             if exit_low:
                 force_mode('exit')
             elif enter_low:
@@ -895,7 +982,7 @@ def main():
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        sense.clear()
+        # sense.clear()
         GPIO.cleanup()
 
 if __name__ == "__main__":
