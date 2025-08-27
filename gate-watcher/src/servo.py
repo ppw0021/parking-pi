@@ -30,7 +30,10 @@ def set_gate(gate_id: int, close: bool):
 
     else:
         # Open
-        angle = 90
+        if gate_id == 0:
+            angle = 70
+        else:
+            angle = 90
 
     # Safety clamp
     angle = max(0, min(180, angle))
@@ -47,7 +50,7 @@ def set_gate(gate_id: int, close: bool):
 
     try:
         pwm.ChangeDutyCycle(duty)
-        sleep(0.5)  # wait for the servo to reach position
+        sleep(0.7)  # wait for the servo to reach position
     finally:
         pwm.stop()
         GPIO.cleanup()
