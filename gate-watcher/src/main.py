@@ -341,12 +341,12 @@ def led_set(led_side, led_color, delay):
     if led_side == 'enter':
         GPIO.output(ENTRY_LED_PINS[led_color], GPIO.HIGH)
         if delay:
-            time.slep(delay)
+            time.sleep(delay)
             return
     if led_side == 'exit':
         GPIO.output(ENTRY_LED_PINS[led_color], GPIO.HIGH)
         if delay:
-            time.slep(delay)
+            time.sleep(delay)
             return
 
 
@@ -959,7 +959,7 @@ def main():
     prev_state = (None, None)
 
     # Camera picture settings
-    brightness = 130
+    brightness = 125
     contrast = 170
     gain = 128
 
