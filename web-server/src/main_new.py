@@ -1,9 +1,40 @@
 from flask import Flask
 import sqlite3
+import time
 
-# con = sqlite3.connect("parkinglot.db")
+# This creates the database if it does not exist
+con = sqlite3.connect("parkinglot.db")
+cur = con.cursor()
 
-# cur = con.cursor()
+# This erases the database
+cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+tables = cur.fetchall()
+for table_name in tables:
+    cur.execute(f"DROP TABLE IF EXISTS {table_name[0]}")
+con.commit()
+
+# This creates a 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS parking_lot (
+    plate TEXT,
+    time_in INTEGER,
+    paid_to_time INTEGER
+)
+""")
+con.commit()
+
+cur.execute("INSERT INTO parking_lot (plate, time_in, paid_to_time) VALUES (?, ?, ?)",
+            ("ABC123", 1700000000, 1700003600))
+con.commit()
+
+# Query all rows
+cur.execute("SELECT * FROM parking_lot")
+rows = cur.fetchall()
+
+con.close()
+
+for row in rows:
+    print(row)
 
 app = Flask(__name__)
 
