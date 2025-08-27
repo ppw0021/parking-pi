@@ -1,4 +1,6 @@
 import requests
+import servo # servo.py
+from time import sleep
 
 '''
 Car entering:
@@ -28,3 +30,13 @@ try:
         # Customer has not paid, blink red LED
 except requests.exceptions.RequestException as e:
     print(f"Request failed: {e}")
+
+
+# Open Gates
+servo.set_gate(0, False)  # Open gate 0 (Entry gate)
+servo.set_gate(1, False)  # Open gate 1 (Exit gate)
+sleep(1)
+
+#Close Gates
+servo.set_gate(0, True)   # Close gate 0 (Entry gate)
+servo.set_gate(1, True)   # Close gate 1 (Exit gate)

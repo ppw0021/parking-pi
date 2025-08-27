@@ -58,10 +58,10 @@ def set_gate(gate_id: int, close: bool):
 # Example usage:
 
 # Open Gates
-set_gate(0, False)  # Open gate 0 (Entry gate)
-set_gate(1, False)  # Open gate 1 (Exit gate)
-sleep(1)
+# set_gate(0, False)  # Open gate 0 (Entry gate)
+# set_gate(1, False)  # Open gate 1 (Exit gate)
+# sleep(1)
 
-#Close Gates
-set_gate(0, True)   # Close gate 0 (Entry gate)
-set_gate(1, True)   # Close gate 1 (Exit gate)
+# #Close Gates
+# set_gate(0, True)   # Close gate 0 (Entry gate)
+# set_gate(1, True)   # Close gate 1 (Exit gate)
