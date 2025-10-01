@@ -63,7 +63,7 @@ def parse_id_from_name(name, fallback):
 
 def capture_image(save_path="current.jpg"):
     """Capture a frame from webcam and save it."""
-    print("📷 Capturing image from webcam...")
+    print("Capturing image from webcam...")
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise SystemExit("Could not access webcam")
@@ -157,7 +157,7 @@ def main():
             # Print JSON nicely
             print(format_json_multiline(spots_data))
             print("Saved annotated image as bayStatus.jpg\n")
-            url = "http://10.138.63.88:5000/update_spots"  # Replace with your actual endpoint
+            url = "http://10.130.1.206:5000/update_spots"  # Replace with your actual endpoint
 
             try:
                 response = requests.post(url, json=spots_data, timeout=5)
