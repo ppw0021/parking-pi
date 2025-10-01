@@ -87,7 +87,7 @@ def analyze_and_prepare_payload(bays_path, ref_path, img_path):
     if ref is None or cur is None:
         raise SystemExit("Could not read reference or current image")
 
-    temp, lumas = {}, []
+    temp = {}
     for b in bays:
         pts = b["points"]
         ref_p, cur_p = crop_polygon(ref, pts), crop_polygon(cur, pts)
@@ -95,9 +95,7 @@ def analyze_and_prepare_payload(bays_path, ref_path, img_path):
             continue
         s_w, d_sat, d_luma = patch_metrics(ref_p, cur_p)
         temp[b["name"]] = (s_w, d_sat, d_luma)
-        lumas.append(d_luma)
 
-    global_luma_shift = np.median(lumas) if lumas else 0.0
     payload = []
     fallback_id = 0
     annotated = cur.copy()
@@ -106,9 +104,16 @@ def analyze_and_prepare_payload(bays_path, ref_path, img_path):
         name = b["name"]
         if name not in temp:
             continue
-        s_w, d_sat, d_luma = temp[name]
-        adj_luma = abs(d_luma - global_luma_shift)
-        taken = (s_w < SSIM_MIN) or (d_sat > SAT_DELTA_MIN) or (adj_luma > LUMA_DELTA_MIN)
+
+        s_w, d_sat, d_luma = temp[name]  # raw per-spot values only
+        adj_luma = abs(d_luma)           # no global compensation
+
+        taken = (
+            (s_w < SSIM_MIN) or
+            (d_sat > SAT_DELTA_MIN) or
+            (adj_luma > LUMA_DELTA_MIN)
+        )
+
         bay_id = parse_id_from_name(name, fallback_id)
         fallback_id += 1
         payload.append({"id": bay_id, "taken": bool(taken)})
@@ -152,7 +157,7 @@ def main():
             # Print JSON nicely
             print(format_json_multiline(spots_data))
             print("Saved annotated image as bayStatus.jpg\n")
-            url = "http://10.130.1.234:5000/update_spots"  # Replace with your actual endpoint
+            url = "http://10.138.63.88:5000/update_spots"  # Replace with your actual endpoint
 
             try:
                 response = requests.post(url, json=spots_data, timeout=5)
