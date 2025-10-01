@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Development version of bay availability sender.
-Prints bay statuses in the user's preferred compact multi-line format and saves bayStatus.jpg.
+Captures image (or uses demo file), detects bays, prints JSON status, and saves annotated bayStatus.jpg.
 """
 
-import argparse, json, re, cv2, numpy as np
+import json, re, cv2, numpy as np, time
 from skimage.metrics import structural_similarity as ssim
-import time
+import requests
 
 # -------- thresholds --------
 SSIM_MIN = 0.85
@@ -61,6 +61,25 @@ def parse_id_from_name(name, fallback):
     m = re.search(r'(\d+)$', name)
     return int(m.group(1)) if m else fallback
 
+def capture_image(save_path="current.jpg"):
+    """Capture a frame from webcam and save it."""
+    print("📷 Capturing image from webcam...")
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise SystemExit("Could not access webcam")
+
+    # Warm-up a few frames
+    for _ in range(5):
+        cap.read()
+
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise SystemExit("Failed to capture image")
+
+    cv2.imwrite(save_path, frame)
+    print(f"Saved {save_path}")
+
 def analyze_and_prepare_payload(bays_path, ref_path, img_path):
     bays = load_bays(bays_path)
     ref = cv2.imread(ref_path)
@@ -81,7 +100,6 @@ def analyze_and_prepare_payload(bays_path, ref_path, img_path):
     global_luma_shift = np.median(lumas) if lumas else 0.0
     payload = []
     fallback_id = 0
-
     annotated = cur.copy()
 
     for b in bays:
@@ -114,28 +132,40 @@ def format_json_multiline(data):
     return "\n".join(lines)
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--bays", default="bays.json")
-    ap.add_argument("--ref", default="empty_reference.jpg")
-    ap.add_argument("--img", default="current.jpg")
-    args = ap.parse_args()
+    json_bays = "bays.json"
+    empty_ref = "empty_reference.jpg"
+    img_to_process = ""
 
-    while (True):
+    demo = False  # set to False to use webcam capture
+    interval = 1  # seconds between captures
+
+    while True:
         try:
-            # Take picture and save to current.jpg
-            
+            if not demo:
+                capture_image("current.jpg")
+                img_to_process = "current.jpg"
+            else:
+                img_to_process = "demo.jpg"
 
-            args.img = "current.jpg"
+            spots_data = analyze_and_prepare_payload(json_bays, empty_ref, img_to_process)
 
-            spots_data = analyze_and_prepare_payload(args.bays, args.ref, args.img)
-            # Print in preferred format
+            # Print JSON nicely
             print(format_json_multiline(spots_data))
-            print("Saved annotated image as bayStatus.jpg")
+            print("Saved annotated image as bayStatus.jpg\n")
+            url = "http://10.130.1.234:5000/update_spots"  # Replace with your actual endpoint
 
-            time.sleep(5)  # wait before next analysis
-            # send_spots_data(spots_data)
+            try:
+                response = requests.post(url, json=spots_data, timeout=5)
+                response.raise_for_status()
+                print(f"Posted to server: {response.status_code}")
+            except requests.RequestException as e:
+                print(f"Failed to post to server: {e}")
+
+            time.sleep(interval)
+
         except Exception as e:
-            print("Error during analysis or sending:", e)
+            print("Error during analysis:", e)
+            time.sleep(1)
 
 if __name__ == "__main__":
     main()

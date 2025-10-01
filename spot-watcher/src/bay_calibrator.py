@@ -263,21 +263,10 @@ def make_app(image_path: str, out_json: str):
 
     return app
 
+img = "empty_reference.jpg"
+output = "bays.json"
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--image", required=True, help="Reference image to annotate (e.g., CarParkReference.jpg)")
-    ap.add_argument("--out", default="bays.json", help="Output file for bays JSON")
-    ap.add_argument("--host", default="0.0.0.0", help="Host (default 0.0.0.0)")
-    ap.add_argument("--port", type=int, default=5000, help="Port (default 5000)")
-    args = ap.parse_args()
-
-    app = make_app(args.image, args.out)
-    print(f"Bay calibration server running — open http://<pi-ip>:{args.port}/ in your browser.")
-    print(f"Using image: {args.image}")
-    print(f"Output file: {args.out}")
-    app.run(host=args.host, port=args.port, debug=False)
-
-
-if __name__ == "__main__":
-    main()
+app = make_app(img, output)
+print(f"Using image: {img}")
+print(f"Output file: {output}")
+app.run()

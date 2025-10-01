@@ -1,15 +1,9 @@
 # bay_calibrator flask app
-uv run python bay_calibrator.py --image CarParkReference.jpg --out bays.json --host 0.0.0.0 --port 5000
+uv run python bay_calibrator.py
 
 #send bay instructions
 change print(json.dumps(spots_data, indent=2))
 to requests.post(url, json=spots_data)
 
 #run send bay status
-uv run python send_bay_status_dev.py --img CarParkTest.jpg --ref empty_reference.jpg
-
-$run detect spots
-uv run python detect_spots.py --img CarParkTest.jpg --ref empty_reference.jpg
-
-#run send spots
-uv run python send_spots.py --file latest_spots.json --dry
+uv run python send_bay_status_dev.py
