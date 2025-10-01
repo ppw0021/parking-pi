@@ -28,7 +28,7 @@ HTML = r"""
     <button id="save">Save (s)</button>
     <button id="load">Load</button>
     <button id="clear">Clear all</button>
-    <button id="confirm">✅ Confirm Calibration</button>
+    <button id="confirm">Confirm Calibration</button>
     <label>Prefix <input id="prefix" size="3"></label>
     <label>Next ID <input id="nextId" type="number" style="width:5ch"></label>
     <label>Bay Name <input id="bayName" size="6" placeholder="auto"></label>
@@ -259,7 +259,7 @@ def make_app(image_path: str, out_json: str):
         # Create a ".confirmed" flag file
         with open(app.config["OUT_JSON"] + ".confirmed", "w") as f:
             f.write("Calibration confirmed.\n")
-        return jsonify({"ok": True, "message": f"✅ Calibration confirmed. {len(bays)} bays saved."})
+        return jsonify({"ok": True, "message": f"Calibration confirmed. {len(bays)} bays saved."})
 
     return app
 
@@ -273,9 +273,9 @@ def main():
     args = ap.parse_args()
 
     app = make_app(args.image, args.out)
-    print(f"🚗 Bay calibration server running — open http://<pi-ip>:{args.port}/ in your browser.")
-    print(f"🖼️  Using image: {args.image}")
-    print(f"📁 Output file: {args.out}")
+    print(f"Bay calibration server running — open http://<pi-ip>:{args.port}/ in your browser.")
+    print(f"Using image: {args.image}")
+    print(f"Output file: {args.out}")
     app.run(host=args.host, port=args.port, debug=False)
 
 

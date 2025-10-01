@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Development version of bay availability sender.
-Prints bay statuses in the user's preferred compact multi-line format and saves bayStatus.jpg.
+Detects parking bay availability and saves results locally.
+Outputs:
+ - latest_spots.json  (IDs + taken status)
+ - bayStatus.jpg      (visual annotated image)
 """
 
 import argparse, json, re, cv2, numpy as np
 from skimage.metrics import structural_similarity as ssim
-import time
 
 # -------- thresholds --------
 SSIM_MIN = 0.85
@@ -58,10 +59,11 @@ def patch_metrics(ref_patch, cur_patch):
     return s_weighted, abs(sat_delta), luma_delta
 
 def parse_id_from_name(name, fallback):
+    import re
     m = re.search(r'(\d+)$', name)
     return int(m.group(1)) if m else fallback
 
-def analyze_and_prepare_payload(bays_path, ref_path, img_path):
+def analyze_and_save(bays_path, ref_path, img_path, out_json="latest_spots.json"):
     bays = load_bays(bays_path)
     ref = cv2.imread(ref_path)
     cur = cv2.imread(img_path)
@@ -81,7 +83,6 @@ def analyze_and_prepare_payload(bays_path, ref_path, img_path):
     global_luma_shift = np.median(lumas) if lumas else 0.0
     payload = []
     fallback_id = 0
-
     annotated = cur.copy()
 
     for b in bays:
@@ -99,43 +100,27 @@ def analyze_and_prepare_payload(bays_path, ref_path, img_path):
         pts = np.array(b["points"], np.int32)
         cv2.polylines(annotated, [pts], True, color, 2)
         p = pts[0]
-        cv2.putText(annotated, f"{bay_id}", (p[0] + 5, p[1] + 20),
+        cv2.putText(annotated, f"{bay_id}", (p[0]+5, p[1]+20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+    # Save annotated image
     cv2.imwrite("bayStatus.jpg", annotated)
-    return payload
 
-def format_json_multiline(data):
-    lines = ["["]
-    for i, item in enumerate(data):
-        comma = "," if i < len(data) - 1 else ""
-        lines.append(f'  {json.dumps(item, separators=(", ", ": "))}{comma}')
-    lines.append("]")
-    return "\n".join(lines)
+    # Save payload JSON
+    with open(out_json, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    print(f"Saved {out_json} and bayStatus.jpg")
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bays", default="bays.json")
     ap.add_argument("--ref", default="empty_reference.jpg")
     ap.add_argument("--img", default="current.jpg")
+    ap.add_argument("--out", default="latest_spots.json")
     args = ap.parse_args()
 
-    while (True):
-        try:
-            # Take picture and save to current.jpg
-            
-
-            args.img = "current.jpg"
-
-            spots_data = analyze_and_prepare_payload(args.bays, args.ref, args.img)
-            # Print in preferred format
-            print(format_json_multiline(spots_data))
-            print("Saved annotated image as bayStatus.jpg")
-
-            time.sleep(5)  # wait before next analysis
-            # send_spots_data(spots_data)
-        except Exception as e:
-            print("Error during analysis or sending:", e)
+    analyze_and_save(args.bays, args.ref, args.img, args.out)
 
 if __name__ == "__main__":
     main()

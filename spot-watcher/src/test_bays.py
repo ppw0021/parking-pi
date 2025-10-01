@@ -115,7 +115,7 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
     cv2.imwrite(args.out, annotated)
-    print(f"\n✅ Free: {free}/{len(bays)}  (saved {args.out})")
+    print(f"\nFree: {free}/{len(bays)}  (saved {args.out})")
 
 if __name__ == "__main__":
     main()

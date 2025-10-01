@@ -7,3 +7,9 @@ to requests.post(url, json=spots_data)
 
 #run send bay status
 uv run python send_bay_status_dev.py --img CarParkTest.jpg --ref empty_reference.jpg
+
+$run detect spots
+uv run python detect_spots.py --img CarParkTest.jpg --ref empty_reference.jpg
+
+#run send spots
+uv run python send_spots.py --file latest_spots.json --dry

@@ -1,0 +1,66 @@
+[
+  {
+    "id": 0,
+    "taken": false
+  },
+  {
+    "id": 1,
+    "taken": false
+  },
+  {
+    "id": 2,
+    "taken": true
+  },
+  {
+    "id": 3,
+    "taken": false
+  },
+  {
+    "id": 4,
+    "taken": true
+  },
+  {
+    "id": 5,
+    "taken": false
+  },
+  {
+    "id": 6,
+    "taken": true
+  },
+  {
+    "id": 7,
+    "taken": false
+  },
+  {
+    "id": 8,
+    "taken": true
+  },
+  {
+    "id": 9,
+    "taken": false
+  },
+  {
+    "id": 10,
+    "taken": false
+  },
+  {
+    "id": 11,
+    "taken": true
+  },
+  {
+    "id": 12,
+    "taken": false
+  },
+  {
+    "id": 13,
+    "taken": false
+  },
+  {
+    "id": 14,
+    "taken": false
+  },
+  {
+    "id": 15,
+    "taken": true
+  }
+]
