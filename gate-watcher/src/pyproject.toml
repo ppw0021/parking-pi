@@ -14,4 +14,7 @@ dependencies = [
     "rpi-gpio>=0.7.1",
     "sense-hat>=2.6.0",
     "smbus>=1.1.post2",
+    "opencv-python>=4.9.0",
+    "numpy>=2.2.0",
+    "pytesseract>=0.3.10",
 ]
