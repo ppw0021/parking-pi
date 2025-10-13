@@ -1,14 +1,5 @@
-import requests
-import servo # servo.py
-from time import sleep
-import cv2
-import numpy as np
-import pytesseract
-import time
-from datetime import datetime
-
 '''
-GateWatcher:
+GateWatcher v0.0.5:
 The code monitors the gates of a parking lot.
 If a license plate is detected on the right part of the creen,
 It means a car is entering, so the code will issue a call to the server:
@@ -25,30 +16,44 @@ The server will reply with one of the following status_codes:
     121 - if the fees for the parking were NOT paid for this car
     122 - if any error occured
 
+v0.0.3:
 Antispam feature added:
     Read OCR every 500 milliseconds
     Block similar/partial re-sends for 10 seconds after last send
     If still the same number after timeout - print "{plate}, please move on"
     If after timeout the number is similar - send the new plate
+
+v0.0.5:
+
+ - 'e' toggles ENTER-only scanning (right side).
+ - 'x' toggles EXIT-only scanning (left side).
+ - Multi-sample OCR filter picks the best plate over a short window.
 '''
+import requests
+import servo # servo.py
+from time import sleep
+import cv2
+import numpy as np
+import pytesseract
+from pytesseract import Output
+import time
+from datetime import datetime
 
-# Replace with your target IP (and include http:// or https://)
-url = "http://127.0.0.1:5000"
+def testServerConnection():
+    try:
+        plate = "54"
+        uri = url + "/exit/" + plate
+        response = requests.get(uri, timeout=5)
+        print(f"Status code: {response.status_code}")
 
-try:
-    plate = "54"
-    uri = url + "/exit/" + plate
-    response = requests.get(uri, timeout=5)
-    print(f"Status code: {response.status_code}")
-
-    if (response.status_code == 201):
-        print("Customer has paid, open the gate")
-        # customer has paid open the gates, blink LED whatever
-    elif (response.status_code == 202):
-        print("Customer has not paid, do not open gate")
-        # Customer has not paid, blink red LED
-except requests.exceptions.RequestException as e:
-    print(f"Request failed: {e}")
+        if (response.status_code == 201):
+            print("Customer has paid, open the gate")
+            # customer has paid open the gates, blink LED whatever
+        elif (response.status_code == 202):
+            print("Customer has not paid, do not open gate")
+            # Customer has not paid, blink red LED
+    except requests.exceptions.RequestException as e:
+        print(f"Request failed: {e}")
 
 
 # Open Gates
@@ -62,6 +67,9 @@ except requests.exceptions.RequestException as e:
 
 # ---- Configuration ---------------------------------------------------------
 
+# Replace with your target IP (and include http:// or https://)
+url = "http://127.0.0.1:5000"
+
 CAMERA_INDEX = 0                 # Ususaly '0' for the first connected camera
 WEB_PI_IP = "http://127.0.0.1"  # Holds the IP of the web server pi
 URL = f"{WEB_PI_IP}:5000"        # Holds the full address of the server
@@ -70,12 +78,14 @@ MIN_AREA = 2000              #
 ASPECT_MIN = 2.0             # 
 ASPECT_MAX = 6.0             # 
 MAX_CANDIDATES = 6           # 
+PRINT_ALL_OCR = True         # 
+
+# Tesseract configuration:
 TESS_CFG = "--oem 1 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-PRINT_ALL_OCR = True
 
 # OCR constants:
-EXIT_ZONE_X_LIMIT  = 0.4     # 
-ENTER_ZONE_X_LIMIT = 0.6     # 
+EXIT_ZONE_X_LIMIT  = 0.4     # Left  side -> Exit
+ENTER_ZONE_X_LIMIT = 0.6     # Right side -> Entrance
 
 # Anti-Spam controls:
 READ_PERIOD = 0.5            # seconds, 2 Hz OCR/evaluation
@@ -88,6 +98,12 @@ SIMILAR_TIMEOUT = 10.0      # seconds to block similar/partial plates
 SIMILAR_DISTANCE_MAX = 1    # Levenshtein distance threshold
 PARTIAL_MIN_MATCH_DROP = 1  # Allow one missing char in a prefix match
 
+# Multi-OCR aggregation controls:
+AGGR_MAX_SAMPLES = 5           # collect up to N OCR samples
+AGGR_WINDOW = 0.7              # or until this many seconds pass
+PREF_LEN_STRONG = {6, 7}       # strong length preference
+PREF_LEN_WEAK = {5, 8}         # weak length preference
+
 # Global Anti-spam state variables:
 last_sent_plate = ""        # last plate sent to server
 block_active = False        # are we in 10 s block window?
@@ -99,6 +115,13 @@ last_seen_time = 0.0        # monotonic time when we saw last candidate
 last_seen_equal = False     # whether last seen equals last_sent_plate
 
 next_read_ts = 0.0          # throttle OCR (monotonic time)
+
+#Scan mode controlled by keys/buttons
+scan_mode = 'idle'
+
+#OCR aggregation "buckets"
+aggr_left  = {'samples': [], 'start_ts': 0.0}
+aggr_right = {'samples': [], 'start_ts': 0.0}
 
 # ---- Functions -------------------------------------------------------------
 # -------- Similarity --------------------------------------------------------
@@ -194,6 +217,29 @@ def find_plate_candidates(frame_bgr):
     return boxes[:MAX_CANDIDATES]
 
 
+def ocr_text_and_conf(img_bin):
+    """
+    Function: ocr_text_and_conf
+    Purpose: Run Tesseract OCR and return text with avg confidence.
+    Methods: pytesseract.image_to_data with Output.DICT; average conf.
+    Creates: data dict, confs list, avg_conf float, raw string.
+    """
+    data = pytesseract.image_to_data(
+        img_bin, config=TESS_CFG, output_type=Output.DICT
+    )
+    confs = []
+    for c in data.get('conf', []):
+        try:
+            v = int(c)
+            if v >= 0:
+                confs.append(v)
+        except ValueError:
+            continue
+    avg_conf = float(sum(confs)) / max(len(confs), 1)
+    raw = " ".join([w for w in data.get('text', []) if w.strip()])
+    return raw, avg_conf
+
+
 def ocr_plate(roi_bin):
     """
     Function: ocr_plate
@@ -227,7 +273,7 @@ def pick_best_by_side(boxes, frame_width):
     Creates: best_left, best_right tuples (x, y, w, h) or None.
     """
     left_zone = [b for b in boxes if b[0] < frame_width * EXIT_ZONE_X_LIMIT]
-    right_zone = [b for b in boxes if b[0] > frame_width * ENTER_ZONE_X_LIMIT6]
+    right_zone = [b for b in boxes if b[0] > frame_width * ENTER_ZONE_X_LIMIT]
 
     def area(b): return b[2] * b[3]
     left_zone.sort(key=area, reverse=True)
@@ -236,6 +282,32 @@ def pick_best_by_side(boxes, frame_width):
     best_left = left_zone[0] if left_zone else None
     best_right = right_zone[0] if right_zone else None
     return best_left, best_right
+
+
+# ------------- OCR on bbox (with confidence) -------------------------------
+def ocr_bbox(frame, box):
+    """
+    Function: ocr_bbox
+    Purpose: Run OCR on a single bbox and normalize the text; also
+             compute OCR confidence.
+    Methods: crop, resize, preprocess_roi, ocr_text_and_conf, normalize.
+    Creates: roi, th, raw, plate strings; conf float; px int.
+    """
+    (x, y, w, h) = box
+    roi = frame[y:y + h, x:x + w]
+    roi = cv2.resize(
+        roi, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC
+    )
+    th = preprocess_roi(roi)
+    raw, conf = ocr_text_and_conf(th)
+    plate = normalize_plate(raw)
+    if PRINT_ALL_OCR:
+        side = 'L' if x < frame.shape[1] * 0.5 else 'R'
+        print(
+            f"[side {side}] raw={raw!r} norm={plate!r} conf={conf:.1f}"
+        )
+    return plate, conf, x
+
 
 # -------- Server interaction ------------------------------------------------
 def send_plate_event(plate, x, frame_width):
@@ -289,26 +361,6 @@ def start_block(plate):
     last_seen_x = 0
     last_seen_time = now
     last_seen_equal = True
-
-
-def ocr_bbox(frame, box):
-    """
-    Function: ocr_bbox
-    Purpose: Run OCR on a single bbox and normalize the text.
-    Methods: crop, resize, preprocess_roi, ocr_plate, normalize_plate.
-    Creates: roi, th, raw, plate strings.
-    """
-    (x, y, w, h) = box
-    roi = frame[y:y + h, x:x + w]
-    roi = cv2.resize(roi, None, fx=2.0, fy=2.0,
-                     interpolation=cv2.INTER_CUBIC)
-    th = preprocess_roi(roi)
-    raw = ocr_plate(th)
-    plate = normalize_plate(raw)
-    if PRINT_ALL_OCR:
-        print(f"[side {'L' if x < frame.shape[1]*0.5 else 'R'}] "
-              f"raw={raw!r} norm={plate!r}")
-    return plate, x
 
 
 def handle_candidate(candidate, x, frame_width):
@@ -388,26 +440,125 @@ def check_timeout(frame_width):
     # Next candidate will start a new block on send.
 
 
-# ---- Main Loop -------------------------------------------------------------
+# ---------------- Multi-OCR aggregation ------------------------------------
+def clear_aggr(bucket):
+    """
+    Function: clear_aggr
+    Purpose: Reset aggregation bucket to empty state.
+    Methods: Clear list and zero start_ts.
+    Creates: empties 'samples', sets 'start_ts' to 0.
+    """
+    bucket['samples'].clear()
+    bucket['start_ts'] = 0.0
 
+
+def add_sample(bucket, plate, conf, x):
+    """
+    Function: add_sample
+    Purpose: Add an OCR sample to the aggregation bucket.
+    Methods: Append tuple; set start_ts on the first sample.
+    Creates: tuples in 'samples': (plate, conf, x, ts).
+    """
+    now = time.monotonic()
+    if not bucket['samples']:
+        bucket['start_ts'] = now
+    bucket['samples'].append((plate, float(conf), int(x), now))
+
+
+def choose_best(samples):
+    """
+    Function: choose_best
+    Purpose: From aggregated samples choose the best plate string.
+    Methods: Group by plate; score=avg_conf + 10*freq + length bonus.
+    Creates: dict per plate with freq, avg_conf, last_x; returns tuple.
+    """
+    if not samples:
+        return "", 0
+    stats = {}
+    for plate, conf, x, ts in samples:
+        if not plate:
+            # Ignore empty reads; they do not help selection
+            continue
+        s = stats.setdefault(plate, {'sum': 0.0, 'n': 0, 'x': x})
+        s['sum'] += conf
+        s['n'] += 1
+        s['x'] = x  # use the most recent x
+    if not stats:
+        return "", 0
+    best_plate, best_score, best_x = "", -1e9, 0
+    for p, s in stats.items():
+        avg_conf = s['sum'] / max(s['n'], 1)
+        freq = s['n']
+        L = len(p)
+        len_bonus = 0.0
+        if L in PREF_LEN_STRONG:
+            len_bonus = 5.0
+        elif L in PREF_LEN_WEAK:
+            len_bonus = 2.5
+        score = avg_conf + 10.0 * freq + len_bonus
+        if score > best_score:
+            best_plate = p
+            best_score = score
+            best_x = s['x']
+    return best_plate, best_x
+
+
+def maybe_finalize(bucket, frame_width):
+    """
+    Function: maybe_finalize
+    Purpose: Decide when to stop sampling and emit the best candidate.
+    Methods: Finalize on count>=AGGR_MAX_SAMPLES or time window passed.
+    Creates: Calls handle_candidate(); clears bucket afterwards.
+    """
+    if not bucket['samples']:
+        return
+    now = time.monotonic()
+    enough_count = (len(bucket['samples']) >= AGGR_MAX_SAMPLES)
+    enough_time = ((now - bucket['start_ts']) >= AGGR_WINDOW)
+    if not (enough_count or enough_time):
+        return
+    plate, x = choose_best(bucket['samples'])
+    clear_aggr(bucket)
+    if 5 <= len(plate) <= 8:
+        handle_candidate(plate, x, frame_width)
+
+
+# ---------------- Scan mode handling ---------------------------------------
+def toggle_mode(new_mode):
+    """
+    Function: toggle_mode
+    Purpose: Toggle scanning mode between 'idle', 'enter', and 'exit'.
+    Methods: Switch logic; clearing aggregators on mode change.
+    Creates: updates global scan_mode; resets aggr buckets.
+    """
+    global scan_mode
+    global aggr_left, aggr_right
+    if scan_mode == new_mode:
+        scan_mode = 'idle'
+    else:
+        scan_mode = new_mode
+    clear_aggr(aggr_left)
+    clear_aggr(aggr_right)
+    print(f"Scan mode: {scan_mode.upper() if scan_mode!='idle' else 'IDLE'}")
+
+
+# ---------------- Main Loop -------------------------------------------------
 def main():
     """
     Function: main
     Purpose: Open camera, run detection loop with 2 Hz OCR and
-             simplified anti-spam, draw boxes/labels, handle keys.
-    Methods: cv2.VideoCapture, find_plate_candidates, preprocess_roi,
-             ocr_plate, normalize_plate, simple if/else state.
+             anti-spam; react to 'e'/'x' modes and multi-OCR filter.
+    Methods: cv2.VideoCapture, find_plate_candidates, ocr_bbox,
+             aggregation, anti-spam state machine.
     Creates: cap, next_read_ts, labels, vis, key variables.
     """
-    global next_read_ts
-
+    global next_read_ts, scan_mode
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
         print("ERROR: Cannot open USB camera!")
         return
-    print("Press 'q' to quit, 's' to save snapshot.")
+    print("Press 'e' ENTER-only, 'x' EXIT-only, 's' snapshot, 'q' quit.")
     next_read_ts = 0.0
-
     try:
         while True:
             ok, frame = cap.read()
@@ -416,70 +567,72 @@ def main():
                 continue
 
             boxes = find_plate_candidates(frame)
-            best_left, best_right = pick_best_by_side(boxes, frame.shape[1])
-            # Draw labels aligned to boxes
-            labels = [""] * len(boxes)
+            best_left, best_right = pick_best_by_side(
+                boxes, frame.shape[1]
+            )
 
+            # Throttled OCR sampling in active modes only
             now = time.monotonic()
             if now >= next_read_ts:
                 next_read_ts = now + READ_PERIOD
 
-                best_left, best_right = pick_best_by_side(
-                    boxes, frame.shape[1]
-                )
+                if scan_mode == 'exit' and best_left:
+                    p, conf, px = ocr_bbox(frame, best_left)
+                    if p:
+                        add_sample(aggr_left, p, conf, px)
+                    maybe_finalize(aggr_left, frame.shape[1])
 
-                if best_left:
-                    p, px = ocr_bbox(frame, best_left)
-                    if 5 <= len(p) <= 8:
-                        handle_candidate(p, px, frame.shape[1])
-                        try:
-                            i = boxes.index(best_left)
-                            labels[i] = p
-                        except ValueError:
-                            pass
-
-                if best_right:
-                    p, px = ocr_bbox(frame, best_right)
-                    if 5 <= len(p) <= 8:
-                        handle_candidate(p, px, frame.shape[1])
-                        try:
-                            i = boxes.index(best_right)
-                            labels[i] = p
-                        except ValueError:
-                            pass
+                if scan_mode == 'enter' and best_right:
+                    p, conf, px = ocr_bbox(frame, best_right)
+                    if p:
+                        add_sample(aggr_right, p, conf, px)
+                    maybe_finalize(aggr_right, frame.shape[1])
 
                 check_timeout(frame.shape[1])
 
-            # Draw boxes/Labels every frame
+            # Draw boxes/labels every frame
             vis = frame.copy()
-            for (x,y,w,h), lab in zip(boxes, labels) or [""] * len(boxes):
-                cv2.rectangle(vis, (x,y), (x+w, y+h), (0,255,0),2)
-                if lab:
-                    cv2.putText(vis, lab, (x,y - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX,0.6,
-                                (0,255,0), 2, cv2.LINE_AA)
-                    
+            for (x, y, w, h) in boxes:
+                cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            # HUD: show current scan mode
+            hud = "MODE: "
+            if scan_mode == 'idle':
+                hud += "IDLE"
+                color = (200, 200, 200)
+            elif scan_mode == 'enter':
+                hud += "ENTER (Right)"
+                color = (0, 255, 0)
+            else:
+                hud += "EXIT (Left)"
+                color = (0, 255, 255)
+            cv2.putText(
+                vis, hud, (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA
+            )
+
             cv2.imshow("Gate Watcher", vis)
 
-            # Check for user input:
+            # Check for user input (window has the focus)
             key = cv2.waitKey(1) & 0xFF
-            # This is tested in the frame window, not in the terminal
-
             if key == ord('q'):
                 print("Exiting")
                 break
-
             elif key == ord('s'):
                 name = datetime.now().strftime("gate_%Y%m%d_%H%M%S.jpg")
                 cv2.imwrite(name, vis)
                 print(f"Frame saved into {name}")
-            
-    except KeyboardInterrupt:
-        print("\nInterrupted byt Ctrl+C. Exiting...")
+            elif key == ord('e'):   # ENTER side only
+                toggle_mode('enter')
+            elif key == ord('x'):   # EXIT side only
+                toggle_mode('exit')
 
+    except KeyboardInterrupt:
+        print("\nInterrupted by Ctrl+C. Exiting...")
     finally:
         cap.release()
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
