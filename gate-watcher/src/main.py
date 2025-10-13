@@ -1,6 +1,11 @@
 import requests
 import servo # servo.py
 from time import sleep
+import cv2
+import numpy as np
+import pytesseract
+import time
+from datetime import datetime
 
 '''
 GateWatcher:
@@ -47,19 +52,13 @@ except requests.exceptions.RequestException as e:
 
 
 # Open Gates
-servo.set_gate(0, False)  # Open gate 0 (Entry gate)
-servo.set_gate(1, False)  # Open gate 1 (Exit gate)
-sleep(1)
+# servo.set_gate(0, False)  # Open gate 0 (Entry gate)
+# servo.set_gate(1, False)  # Open gate 1 (Exit gate)
+# sleep(1)
 
 #Close Gates
-servo.set_gate(0, True)   # Close gate 0 (Entry gate)
-servo.set_gate(1, True)   # Close gate 1 (Exit gate)
-import cv2
-import numpy as np
-import pytesseract
-import requests
-import time
-from datetime import datetime
+# servo.set_gate(0, True)   # Close gate 0 (Entry gate)
+# servo.set_gate(1, True)   # Close gate 1 (Exit gate)
 
 # ---- Configuration ---------------------------------------------------------
 
@@ -292,6 +291,26 @@ def start_block(plate):
     last_seen_equal = True
 
 
+def ocr_bbox(frame, box):
+    """
+    Function: ocr_bbox
+    Purpose: Run OCR on a single bbox and normalize the text.
+    Methods: crop, resize, preprocess_roi, ocr_plate, normalize_plate.
+    Creates: roi, th, raw, plate strings.
+    """
+    (x, y, w, h) = box
+    roi = frame[y:y + h, x:x + w]
+    roi = cv2.resize(roi, None, fx=2.0, fy=2.0,
+                     interpolation=cv2.INTER_CUBIC)
+    th = preprocess_roi(roi)
+    raw = ocr_plate(th)
+    plate = normalize_plate(raw)
+    if PRINT_ALL_OCR:
+        print(f"[side {'L' if x < frame.shape[1]*0.5 else 'R'}] "
+              f"raw={raw!r} norm={plate!r}")
+    return plate, x
+
+
 def handle_candidate(candidate, x, frame_width):
     """
     Function: handle_candidate
@@ -398,38 +417,37 @@ def main():
 
             boxes = find_plate_candidates(frame)
             best_left, best_right = pick_best_by_side(boxes, frame.shape[1])
-            labels = []
+            # Draw labels aligned to boxes
+            labels = [""] * len(boxes)
 
-            # Make sure OCR is done only twice per second (every 0.5 seconds)
             now = time.monotonic()
             if now >= next_read_ts:
                 next_read_ts = now + READ_PERIOD
 
-                chosen_plate = ""
-                chosen_x = 0
+                best_left, best_right = pick_best_by_side(
+                    boxes, frame.shape[1]
+                )
 
-                for idx, (x,y,w,h) in enumerate(boxes,1):
-                    roi = frame[y:y + h, x:x + w]
-                    roi = cv2.resize(roi, None, fx=2.0, fy=2.0,
-                                    interpolation=cv2.INTER_CUBIC)
-                    th = preprocess_roi(roi)
-                    raw = ocr_plate(th)
-                    plate = normalize_plate(raw)
+                if best_left:
+                    p, px = ocr_bbox(frame, best_left)
+                    if 5 <= len(p) <= 8:
+                        handle_candidate(p, px, frame.shape[1])
+                        try:
+                            i = boxes.index(best_left)
+                            labels[i] = p
+                        except ValueError:
+                            pass
 
-                    if PRINT_ALL_OCR:
-                        print(f"[cand {idx}] raw={raw!r} norm={plate!r}")
+                if best_right:
+                    p, px = ocr_bbox(frame, best_right)
+                    if 5 <= len(p) <= 8:
+                        handle_candidate(p, px, frame.shape[1])
+                        try:
+                            i = boxes.index(best_right)
+                            labels[i] = p
+                        except ValueError:
+                            pass
 
-                    if 5 <= len(plate) <= 8:
-                        if not chosen_plate:
-                            chosen_plate = plate
-                            chosen_x = x
-                        labels.append(plate)
-                    else:
-                        labels.append("")
-                if  chosen_plate:
-                    handle_candidate(chosen_plate, chosen_x, frame.shape[1])
-
-                # Check if timeout reached
                 check_timeout(frame.shape[1])
 
             # Draw boxes/Labels every frame
