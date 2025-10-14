@@ -95,7 +95,7 @@ function updateParkingSpots() {
 }
 
 // Poll every 5 seconds
-setInterval(updateParkingSpots, 5000);
+setInterval(updateParkingSpots, 1000);
 
 // Initial call on page load
 window.addEventListener('DOMContentLoaded', updateParkingSpots);
