@@ -69,6 +69,37 @@ checkBtn.addEventListener("click", async () => {
     }
 });
 
+// Periodically fetch parking spot status and update UI
+function updateParkingSpots() {
+    fetch('/spots')
+        .then(response => response.json())
+        .then(data => {
+            // data is an object: { '1': false, '2': true, ... }
+            Object.entries(data).forEach(([id, taken]) => {
+                const spot = document.querySelector(`.spot[data-id="${id}"]`);
+                if (spot) {
+                    if (taken) {
+                        spot.classList.add('taken');
+                        spot.classList.remove('available');
+                    } else {
+                        spot.classList.add('available');
+                        spot.classList.remove('taken');
+                    }
+                }
+            });
+        })
+        .catch(err => {
+            // Optionally handle error
+            // console.error('Failed to fetch spots:', err);
+        });
+}
+
+// Poll every 5 seconds
+setInterval(updateParkingSpots, 5000);
+
+// Initial call on page load
+window.addEventListener('DOMContentLoaded', updateParkingSpots);
+
 // --- Pay button ---
 payBtn.addEventListener("click", async () => {
     const plate = plateInput.value.trim();
