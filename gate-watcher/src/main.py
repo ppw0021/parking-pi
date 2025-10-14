@@ -87,7 +87,7 @@ MIN_FINAL_LEN   = (5, 8) # Allowed length range for acceptable string
 MIN_FINAL_SAMPLES = 2    # Need >=2 valid readings
 
 # Image processing
-AREA_MIN  = 6000
+AREA_MIN  = 1000
 AREA_MAX  = 10000
 AREA_STEP = 200
 AREA_ABS_MIN = 200
