@@ -1,4 +1,4 @@
-from flask import Flask
+from flask import Flask, jsonify, request, render_template
 import sqlite3
 import time
 import re
@@ -37,15 +37,16 @@ initCon.close()
 
 app = Flask(__name__)
 
-# Base route
+# Customer panel
 @app.route("/")
 def root():
-    return "Welcome to the parking service"
+    # Render the HTML file in templates/
+    return render_template("index.html")
 
-# Customer panel
-@app.route("/customer")
-def customer():
-    return "Customer Panel"
+@app.route("/ping")
+def ping():
+    print("Ping received!")  # this will show in your terminal
+    return jsonify({"message": "Pong from server!"})
 
 # Admin panel
 @app.route("/admin")
@@ -127,5 +128,35 @@ def exit(plate):
     finally:
         cur.close()
         con.close()
+
+parking_spots = {str(i): False for i in range(16)}  # False = free, True = taken
+
+
+@app.post("/update_spots")
+def update_spots():
+    data = request.get_json()
+
+    if not isinstance(data, list):
+        return jsonify({"error": "Expected a JSON array"}), 400
+
+    for spot in data:
+        if "id" in spot and "taken" in spot:
+            spot_id = str(spot["id"])
+            if spot_id in parking_spots:
+                parking_spots[spot_id] = bool(spot["taken"])
+            else:
+                return jsonify({"error": f"Invalid spot id: {spot_id}"}), 400
+        else:
+            return jsonify({"error": "Each spot must have 'id' and 'taken'"}), 400
+
+    return jsonify({
+        "message": "Spots updated successfully",
+        "spots": parking_spots
+    }), 200
+
+
+@app.get("/spots")
+def get_spots():
+    return jsonify(parking_spots)
 
 app.run()
