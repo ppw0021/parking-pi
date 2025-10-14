@@ -68,24 +68,34 @@ url = "http://127.0.0.1:5000"
 CAMERA_INDEX = 0  # Ususaly '0' for the first connected camera
 WEB_PI_IP = "http://127.0.0.1"  # Holds the IP of the web server pi
 URL = f"{WEB_PI_IP}:5000"  # Holds the full address of the server
-MIN_AREA = 1000  #
 ASPECT_MIN = 2.0 #
 ASPECT_MAX = 6.0 #
 MAX_CANDIDATES = 10 #
 PRINT_ALL_OCR = True #
 
-# Tesseract configuration:
-TESS_CFG = "--oem 1 --psm 7 -c " \
-           "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 # OCR constants:
 EXIT_ZONE_X_LIMIT = 0.52  # Left side -> Exit
 ENTER_ZONE_X_LIMIT = 0.58 # Right side -> Entrance
 
+# Tesseract configuration:
+TESS_CFG = "--oem 1 --psm 7 -c " \
+           "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 MIN_SAMPLE_CONF = 45.0   # Tesseract confidence threshold
 MIN_FINAL_CONF  = 55.0   # Minimal average confidence to be sent
 MIN_FINAL_LEN   = (5, 8) # Allowed length range for acceptable string
 MIN_FINAL_SAMPLES = 2    # Need >=2 valid readings
+
+# Image processing
+AREA_MIN  = 8000
+AREA_MAX  = 20000
+AREA_STEP = 200
+AREA_ABS_MIN = 200
+area_min  = AREA_MIN
+area_max  = AREA_MAX
+
+# Camera Constants
+CAMERA_RESOLUTION = (1280, 720)  # or (1920, 1080), (640, 480)
 
 # Anti-Spam controls:
 READ_PERIOD = 0.5              # seconds, 2 Hz OCR/evaluation
@@ -126,8 +136,8 @@ aggr_right = {'samples': [], 'start_ts': 0.0}
 show_zones = True  # press 'z' to toggle at runtime
 
 # --- GPIO pins and LED arrow patterns ---------------------------------------
-PIN_ENTER = 4    # BCM 4  -> Enter (Down arrow)
-PIN_EXIT  = 14   # BCM 14 -> Exit  (Up arrow)
+PIN_ENTER = 4    # BCM 4  -> Enter (Up arrow)
+PIN_EXIT  = 14   # BCM 14 -> Exit  (Down arrow)
 DEBOUNCE_SEC = 0.05
 
 RED  = (255, 0, 0)
@@ -277,6 +287,34 @@ def is_partial_or_similar(a, b):
     return False
 
 # ---------------- Image preprocessing and OCR -------------------------------
+import subprocess
+
+
+def set_brightness(value):
+    value = max(0, min(255, value))
+    subprocess.call([
+        "v4l2-ctl", "--device=/dev/video0", "--set-ctrl", f"brightness={value}"
+    ])
+    print(f"Яркость: {value}")
+    return value
+
+def set_contrast(value):
+    value = max(0, min(255, value))
+    subprocess.call([
+        "v4l2-ctl", "--device=/dev/video0", "--set-ctrl", f"contrast={value}"
+    ])
+    print(f"Контраст: {value}")
+    return value
+
+def set_gain(value):
+    value = max(0, min(255, value))
+    subprocess.call([
+        "v4l2-ctl", "--device=/dev/video0", "--set-ctrl", f"gain={value}"
+    ])
+    print(f"Gain: {value}")
+    return value
+
+
 def preprocess_roi(roi_bgr):
     """
     Function: preprocess_roi
@@ -292,32 +330,51 @@ def preprocess_roi(roi_bgr):
     )
     return th
 
+
 def find_plate_candidates(frame_bgr):
     """
     Function: find_plate_candidates
     Purpose: Detect rectangular regions that may contain a plate.
-    Methods: Gray, blur, Canny edges, dilate, contours, aspect filter.
+    Methods: Gray, blur, Canny edges, dilate, contours, aspect filter,
+             binary mask for black-on-white text.
     Creates: edges image, cnts list, boxes list of (x, y, w, h).
     """
+    # 50 shades of Grey
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, 80, 200)
+
+    # Blurring to remove the noise
+    # gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Implementing binary mask: Search for black-on-white text
+    _, binary_mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+
+    # Combining the mask with the original image
+    combined = cv2.bitwise_and(gray, binary_mask)
+
+    # highlighting the boundaries
+    edges = cv2.Canny(combined, 80, 200)
+
+    # Expanding boudaries
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     edges = cv2.dilate(edges, k, iterations=1)
-    cnts, _ = cv2.findContours(
-        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+
+    # Searching for contours
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     boxes = []
     for c in cnts:
         area = cv2.contourArea(c)
-        if area < MIN_AREA:
+        if area < area_min or area > area_max:
             continue
         x, y, w, h = cv2.boundingRect(c)
         aspect = w / max(h, 1)
         if ASPECT_MIN <= aspect <= ASPECT_MAX:
             boxes.append((x, y, w, h))
+
+    # Sorting by area, returning the best candidates
     boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
     return boxes[:MAX_CANDIDATES]
+
 
 def ocr_text_and_conf(img_bin):
     """
@@ -778,6 +835,8 @@ def main():
     GPIO.setup(PIN_EXIT,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_RESOLUTION[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_RESOLUTION[1])
     if not cap.isOpened():
         print("ERROR: Cannot open USB camera!")
         GPIO.cleanup()
@@ -789,6 +848,14 @@ def main():
 
     next_read_ts = 0.0
     prev_state = (None, None)
+
+    # Camera picture settings
+    brightness = 128
+    contrast = 128
+    gain = 128
+
+    # OCR area settings
+    global area_min, area_max
 
     try:
         while True:
@@ -872,6 +939,31 @@ def main():
             elif key == ord('z'):    # Toggle enter/exit zones
                 show_zones = not show_zones
                 print(f"Zone overlay: {'ON' if show_zones else 'OFF'}")
+            elif key == ord(','):
+                brightness -= 5
+                brightness = set_brightness(brightness)
+
+            elif key == ord('.'):
+                brightness += 5
+                brightness = set_brightness(brightness)
+
+            elif key == ord(';'):
+                contrast -= 5
+                contrast = set_contrast(contrast)
+
+            elif key == ord("'"):
+                contrast += 5
+                contrast = set_contrast(contrast)
+            
+            elif key == ord('['):
+                area_min = max(AREA_ABS_MIN, area_min - AREA_STEP)
+                area_max = max(area_min + 2.5*AREA_ABS_MIN, area_max - AREA_STEP)
+                print(f"Area range: {area_min}–{area_max}")
+
+            elif key == ord(']'):
+                area_min = min(60000, area_min + AREA_STEP)
+                area_max = min(100000, area_max + AREA_STEP)
+                print(f"Area range: {area_min}–{area_max}")
 
     except KeyboardInterrupt:
         print("\nInterrupted by Ctrl+C. Exiting...")
