@@ -23,7 +23,9 @@
                     <input type="text" id="plateInput" placeholder="Enter plate (e.g. ABC123)">
                     <button id="checkBtn">Check</button>
                 </div>
-
+                <div id="messageBox" class="info-box hidden">
+                    <p>message</p>
+                </div>
                 <div id="infoBox" class="info-box hidden">
                     <p><strong>Time Parked:</strong> <span id="timeParked">--</span></p>
                     <p><strong>Total Due:</strong> $<span id="totalDue">--</span></p>
@@ -32,7 +34,7 @@
             </div>
 
             <div id="successMessage" class="info-box hidden">
-                <p>You have <strong>5 minutes</strong> to exit.</p>
+                <p>Payment successful.</p>
                 <button id="newPaymentBtn">Pay for another car</button>
             </div>
         </section>
@@ -44,6 +46,7 @@
                 <tbody>
                     <!-- Row 1 -->
                     <tr>
+                        <td class="ref-column">Entry</td> <!-- New reference column -->
                         <td class="spot available" data-id="1">1</td>
                         <td class="spot taken" data-id="2">2</td>
                         <td class="spot available" data-id="3">3</td>
@@ -54,6 +57,7 @@
 
                     <!-- Row 2 -->
                     <tr>
+                        <td class="ref-column">--</td> <!-- No entry/exit here -->
                         <td class="road"></td> <!-- Road space instead of spot 7 -->
                         <td class="spot available" data-id="7">7</td>
                         <td class="spot taken" data-id="8">8</td>
@@ -64,6 +68,7 @@
 
                     <!-- Row 3 -->
                     <tr>
+                        <td class="ref-column">Exit</td> <!-- Reference column -->
                         <td class="spot available" data-id="11">11</td>
                         <td class="spot taken" data-id="12">12</td>
                         <td class="spot available" data-id="13">13</td>

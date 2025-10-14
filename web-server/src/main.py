@@ -3,6 +3,10 @@ import sqlite3
 import time
 import re
 
+# Constant for time (seconds)
+entryGracePeriod = 10
+exitGracePeriod = 300
+
 # This creates the database if it does not exist
 initCon = sqlite3.connect("parkinglot.db")
 initCur = initCon.cursor()
@@ -10,28 +14,21 @@ initCur = initCon.cursor()
 # This erases the database
 initCur.execute("SELECT name FROM sqlite_master WHERE type='table';")
 tables = initCur.fetchall()
-for table_name in tables:
-    initCur.execute(f"DROP TABLE IF EXISTS {table_name[0]}")
+for tableName in tables:
+    initCur.execute(f"DROP TABLE IF EXISTS {tableName[0]}")
     print("Reset")
 initCon.commit()
 
-# This creates a fresh table
+# This creates a fresh table with camelCase columns
 initCur.execute("""
-CREATE TABLE IF NOT EXISTS parking_lot (
+CREATE TABLE IF NOT EXISTS parkingLot (
     plate TEXT,
-    time_in INTEGER,
-    paid_to_time INTEGER
+    timeIn INTEGER,
+    paidToTime INTEGER
 )
 """)
 
 initCon.commit()
-
-# Query all rows
-# cur.execute("SELECT * FROM parking_lot")
-# rows = cur.fetchall()
-# for row in rows:
-#     print(row)
-
 initCur.close()
 initCon.close()
 
@@ -40,13 +37,80 @@ app = Flask(__name__)
 # Customer panel
 @app.route("/")
 def root():
-    # Render the HTML file in templates/
     return render_template("index.html")
 
-@app.route("/ping")
-def ping():
-    print("Ping received!")  # this will show in your terminal
-    return jsonify({"message": "Pong from server!"})
+# Check if a plate exists
+@app.get("/check_plate/<plate>")
+def checkPlate(plate):
+    plate = plate.lower()
+    try:
+        con = sqlite3.connect("parkinglot.db")
+        cur = con.cursor()
+
+        # Get timeIn and paidToTime for the plate
+        cur.execute("SELECT timeIn, paidToTime FROM parkingLot WHERE plate = ?", (plate,))
+        result = cur.fetchone()
+
+        if not result:
+            return jsonify({
+                "plate": plate,
+                "exists": False,
+                "totalParkedSeconds": 0,
+                "paid": False
+            }), 200
+        
+        timeNow = int(time.time())
+
+        timeIn, paidToTime = result
+        timeOwed = timeNow - paidToTime
+
+        isPaid = True
+        if timeOwed > 0:
+            isPaid = False
+
+        return jsonify({
+            "plate": plate,
+            "exists": True,
+            "timeOwed": timeOwed,
+            "paid": isPaid
+        }), 200
+
+    except Exception as e:
+        print(f"Error checking plate {plate}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        cur.close()
+        con.close()
+
+# Pay
+@app.route("/pay/<plate>")
+def pay(plate):
+    plate = plate.lower()
+    try:
+        con = sqlite3.connect("parkinglot.db")
+        cur = con.cursor()
+
+        # Check if plate exists
+        cur.execute("SELECT 1 FROM parkingLot WHERE plate = ?", (plate,))
+        if not cur.fetchone():
+            return jsonify({"error": "Plate not found"}), 404
+
+        # Update paidToTime
+        paidToTime = int(time.time()) + exitGracePeriod
+        cur.execute(
+            "UPDATE parkingLot SET paidToTime = ? WHERE plate = ?",
+            (paidToTime, plate)
+        )
+        con.commit()
+        return jsonify({"plate": plate, "paidToTime": paidToTime, "message": "Payment successful"}), 200
+
+    except Exception as e:
+        print(f"Error paying for plate {plate}: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        con.close()
 
 # Admin panel
 @app.route("/admin")
@@ -55,9 +119,10 @@ def admin():
 
 # Called by gate-watcher 
 # Adds plate and time to database
-# (210: added | 211: aready exists | 213: error or invalid plate format)
+# (210: added | 211: already exists | 213: error or invalid plate format)
 @app.get("/enter/<plate>")
 def enter(plate):
+    plate = plate.lower()
     try:
         con = sqlite3.connect("parkinglot.db")
         cur = con.cursor()
@@ -67,28 +132,33 @@ def enter(plate):
             raise Exception("invalid plate format")
 
         timeIn = int(time.time())
+        paidToTime = timeIn + entryGracePeriod
 
         # If plate exists
-        cur.execute("SELECT 1 FROM parking_lot WHERE plate = ?", (plate,))
+        cur.execute("SELECT 1 FROM parkingLot WHERE plate = ?", (plate,))
         existing = cur.fetchone()
         if existing:
-            # Exists, do not add
-            return f"{plate} : already exists", 211
+            return jsonify({
+                "message": "already exists"
+            }), 211
 
         # Insert new entry
         cur.execute(
-            "INSERT INTO parking_lot (plate, time_in, paid_to_time) VALUES (?, ?, ?)",
-            (plate, timeIn, timeIn)
+            "INSERT INTO parkingLot (plate, timeIn, paidToTime) VALUES (?, ?, ?)",
+            (plate, timeIn, paidToTime)
         )
         con.commit()
 
-        # Success
-        return f"{plate} : added", 210
+        return jsonify({
+            "message": f"{plate} added"
+        }), 210
 
     except Exception as e:
-        # Error or invalid plate format
         print(f"{plate} : {e}")
-        return f"{plate} : {e}", 213
+        return jsonify({
+            "message": f"{plate} error",
+            "error": f"{e}"
+        }), 213
     finally:
         cur.close()
         con.close()
@@ -97,43 +167,46 @@ def enter(plate):
 # Checks if plate has paid
 # (210: car paid, exit allowed | 211: car not paid, exit, not allowed | 212: plate not found | 213: error)
 @app.get("/exit/<plate>")
-def exit(plate):
-    # Here, code will check if the car is allowed to leave or not 
+def exitLot(plate):
+    plate = plate.lower()
     try:
         con = sqlite3.connect("parkinglot.db")
         cur = con.cursor()
 
-        #Use parameterized query for safety and correctness
-        cur.execute("SELECT * FROM parking_lot WHERE plate = ?", (plate,))
-        result = cur.fetchone()  # get first match (or None if not found)
+        cur.execute("SELECT * FROM parkingLot WHERE plate = ?", (plate,))
+        result = cur.fetchone()
         if not result:
-            # No result found
-            return f"plate : {plate} not found", 212
+            return jsonify({
+                "message": f"{plate} not found"
+            }), 212
         
-        # Logic for checking if car is paid for
-
-        exitPermitted = False
+        _, _, paidToTime = result
+        timeNow = int(time.time())
+        exitPermitted = paidToTime > timeNow
 
         if exitPermitted:
-            # Car is paid up
-            return f"plate : {plate} has paid and is allowed to exit", 210
+            return jsonify({
+                "message": f"{plate} paid up, exit permitted"
+            }), 210
         else:
-            # Car is not paid up
-            return f"plate : {plate} has not paid and is not allowed to exit", 211
+            return jsonify({
+                "message": f"{plate} not paid up, exit not permitted"
+            }), 211
 
     except Exception as e:
-        # Error has occured
         print(f"error: {e}")
-        return f"error: {e}", 213
+        return jsonify({
+            "message": f"{plate} error",
+            "error": f"{e}"
+        }), 213
     finally:
         cur.close()
         con.close()
 
-parking_spots = {str(i): False for i in range(16)}  # False = free, True = taken
-
+parkingSpots = {str(i): False for i in range(16)}  # False = free, True = taken
 
 @app.post("/update_spots")
-def update_spots():
+def updateSpots():
     data = request.get_json()
 
     if not isinstance(data, list):
@@ -141,22 +214,21 @@ def update_spots():
 
     for spot in data:
         if "id" in spot and "taken" in spot:
-            spot_id = str(spot["id"])
-            if spot_id in parking_spots:
-                parking_spots[spot_id] = bool(spot["taken"])
+            spotId = str(spot["id"])
+            if spotId in parkingSpots:
+                parkingSpots[spotId] = bool(spot["taken"])
             else:
-                return jsonify({"error": f"Invalid spot id: {spot_id}"}), 400
+                return jsonify({"error": f"Invalid spot id: {spotId}"}), 400
         else:
             return jsonify({"error": "Each spot must have 'id' and 'taken'"}), 400
 
     return jsonify({
         "message": "Spots updated successfully",
-        "spots": parking_spots
+        "spots": parkingSpots
     }), 200
 
-
 @app.get("/spots")
-def get_spots():
-    return jsonify(parking_spots)
+def getSpots():
+    return jsonify(parkingSpots)
 
-app.run()
+app.run(host="0.0.0.0", port=5000, debug=True)
