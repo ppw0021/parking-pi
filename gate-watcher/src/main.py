@@ -1,5 +1,5 @@
 '''
-GateWatcher v0.0.5:
+GateWatcher v0.0.6 (20251015-1127):
 The code monitors the gates of a parking lot.
 If a license plate is detected on the right part of the creen,
 It means a car is entering, so the code will issue a call to the server:
@@ -87,8 +87,8 @@ MIN_FINAL_LEN   = (5, 8) # Allowed length range for acceptable string
 MIN_FINAL_SAMPLES = 2    # Need >=2 valid readings
 
 # Image processing
-AREA_MIN  = 8000
-AREA_MAX  = 20000
+AREA_MIN  = 6000
+AREA_MAX  = 10000
 AREA_STEP = 200
 AREA_ABS_MIN = 200
 area_min  = AREA_MIN
