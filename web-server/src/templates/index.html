@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Parking Service</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+    <header>
+        <h1>Parking Service</h1>
+    </header>
+
+    <main>
+        <!-- LEFT PANEL -->
+        <section class="left-panel">
+            <h2>Vehicle Entry</h2>
+
+            <div id="paymentForm">
+                <div class="form-group">
+                    <label for="plateInput">Number Plate</label>
+                    <input type="text" id="plateInput" placeholder="Enter plate (e.g. ABC123)">
+                    <button id="checkBtn">Check</button>
+                </div>
+                <div id="messageBox" class="info-box hidden">
+                    <p>message</p>
+                </div>
+                <div id="infoBox" class="info-box hidden">
+                    <p><strong>Time Parked:</strong> <span id="timeParked">--</span></p>
+                    <p><strong>Total Due:</strong> $<span id="totalDue">--</span></p>
+                    <button id="payBtn">Pay Now</button>
+                </div>
+            </div>
+
+            <div id="successMessage" class="info-box hidden">
+                <p>Payment successful.</p>
+                <button id="newPaymentBtn">Pay for another car</button>
+            </div>
+        </section>
+
+        <!-- RIGHT PANEL -->
+        <section class="right-panel">
+            <h2>Parking Spots</h2>
+            <table id="parkingTable">
+                <tbody>
+                    <!-- Row 1 -->
+                    <tr>
+                        <td class="ref-column">Entry</td> <!-- New reference column -->
+                        <td class="spot available" data-id="0">1</td>
+                        <td class="spot available" data-id="1">2</td>
+                        <td class="spot available" data-id="2">3</td>
+                        <td class="spot available" data-id="3">4</td>
+                        <td class="spot available" data-id="4">5</td>
+                        <td class="spot available" data-id="5">6</td>
+                    </tr>
+
+                    <!-- Row 2 -->
+                    <tr>
+                        <td class="ref-column">--</td> <!-- No entry/exit here -->
+                        <td class="road"></td> <!-- Road space instead of spot 7 -->
+                        <td class="spot available" data-id="6">7</td>
+                        <td class="spot available" data-id="7">8</td>
+                        <td class="spot available" data-id="8">9</td>
+                        <td class="spot available" data-id="9">10</td>
+                        <td class="road"></td> <!-- Road space instead of spot 11 -->
+                    </tr>
+
+                    <!-- Row 3 -->
+                    <tr>
+                        <td class="ref-column">Exit</td> <!-- Reference column -->
+                        <td class="spot available" data-id="10">11</td>
+                        <td class="spot available" data-id="11">12</td>
+                        <td class="spot available" data-id="12">13</td>
+                        <td class="spot available" data-id="13">14</td>
+                        <td class="spot available" data-id="14">15</td>
+                        <td class="spot available" data-id="15">16</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+
+</html>

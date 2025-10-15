@@ -49,7 +49,7 @@ except requests.exceptions.RequestException as e:
 # Open Gates
 servo.set_gate(0, False)  # Open gate 0 (Entry gate)
 servo.set_gate(1, False)  # Open gate 1 (Exit gate)
-sleep(1)
+sleep(3)
 
 #Close Gates
 servo.set_gate(0, True)   # Close gate 0 (Entry gate)
