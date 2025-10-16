@@ -1,5 +1,5 @@
 '''
-GateWatcher v0.0.6 (20251015-1500):
+GateWatcher v0.0.7 (20251016-1550):
 The code monitors the gates of a parking lot.
 If a license plate is detected on the right part of the creen,
 It means a car is entering, so the code will issue a call to the server:
@@ -26,6 +26,35 @@ v0.0.5:
  - GPIO4 grounded: Entrance waiting
  - GPIO14 grounded: Exit waiting
  - Multi-sample OCR filter picks the best plate over a short window.
+v0.0.7, Spring cleaning:
+Removed:
+ - levenshtein(...)
+ - is_partial_or_similar
+ - SIMILAR_DISTANCE_MAX
+ - PARTIAL_MIN_MATCH_DROP
+ - block_active, block_deadline, last_seen_plate, last_seen_x, last_seen_time, last_seen_equal
+ - start_block(...)
+ - check_timeout(...)
+ - LOW_CONF_OVERRIDE_ENABLED
+ - LOW_CONF_SAME_COUNT
+ - raw_counts
+ - len_bonus calculation
+ - PREF_LEN_STRONG
+ - PREF_LEN_WEAK 
+
+Added:
+ - BLOCK_TIMEOUT
+
+Changed:
+ - aggr_left + aggr_right
+ - clear_aggr(...)
+ - add_sample(...)
+ - choose_best(...)
+ - maybe_finalize(...)
+ - handle_candidate(...)
+ - main(...):
+ -- check_timeout(...)
+
 '''
 import requests
 import servo  # servo.py
@@ -67,22 +96,19 @@ PRINT_ALL_OCR = True #
 EXIT_ZONE_X_LIMIT = 0.52  # Left side -> Exit
 ENTER_ZONE_X_LIMIT = 0.58 # Right side -> Entrance
 RE_PLATE = re.compile(r'^[A-Z]{3}\d{3}$')
-
-# Allow sending on low confidence if we saw the same valid plate N times
-LOW_CONF_OVERRIDE_ENABLED = True
-LOW_CONF_SAME_COUNT = 3  # send even if avg_conf is low
+REQUIRE_ONE_VALID_SAMPLE_FOR_STREAK = False
 
 # Tesseract configuration:
 TESS_CFG = "--oem 1 --psm 7 -c " \
            "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-MIN_SAMPLE_CONF = 45.0   # Tesseract confidence threshold
-MIN_FINAL_CONF  = 55.0   # Minimal average confidence to be sent
+MIN_SAMPLE_CONF = 40.0   # Tesseract confidence threshold
+MIN_FINAL_CONF  = 50.0   # Minimal average confidence to be sent
 MIN_FINAL_LEN   = (6, 6) # Allowed length range for acceptable string
 MIN_FINAL_SAMPLES = 2    # Need >=2 valid readings
 
 # Image processing
-AREA_MIN  = 1000
-AREA_MAX  = 4000
+AREA_MIN  = 2000
+AREA_MAX  = 5000
 AREA_STEP = 1000
 AREA_ABS_MIN = 200
 area_min  = AREA_MIN
@@ -94,40 +120,35 @@ CAMERA_RESOLUTION = (1280, 720)  # or (1920, 1080), (640, 480)
 # Anti-Spam controls:
 READ_PERIOD = 0.5              # seconds, 2 Hz OCR/evaluation
 SIMILAR_TIMEOUT = 10.0         # seconds to block similar/partial plates
-SIMILAR_DISTANCE_MAX = 1       # Levenshtein distance threshold
-PARTIAL_MIN_MATCH_DROP = 1     # Allow one missing char in a prefix match
-READ_PERIOD = 0.5              # seconds, 2 Hz OCR/evaluation
-SIMILAR_TIMEOUT = 10.0         # seconds to block similar/partial plates
-SIMILAR_DISTANCE_MAX = 1       # Levenshtein distance threshold
-PARTIAL_MIN_MATCH_DROP = 1     # Allow one missing char in a prefix match
 
 # Multi-OCR aggregation controls:
 AGGR_MAX_SAMPLES = 5           # collect up to N OCR samples
-AGGR_WINDOW = 0.7              # or until this many seconds pass
-# PREF_LEN_STRONG = {6, 7}       # strong length preference
-# PREF_LEN_WEAK = {5, 8}         # weak length preference
-PREF_LEN_STRONG = {6}          # strong length preference
-PREF_LEN_WEAK = set()          # weak length preference
+AGGR_WINDOW = 1.1              # or until this many seconds pass
+
+# Allow sending when the same normalized plate repeats in a streak
+LOW_CONF_STREAK_ENABLED = True
+LOW_CONF_STREAK_N = 3  # send even if confidence is low
 
 # HW Constants
 GPIO_STABLE_MS = 300           # 300 mSec jitter prevention
 
 # Global Anti-spam state variables:
 last_sent_plate = ""           # last plate sent to server
-block_active = False           # are we in 10 s block window?
-block_deadline = 0.0           # monotonic deadline when block expires
-last_seen_plate = ""           # most recently observed candidate
-last_seen_x = 0                # x coordinate of last seen candidate
-last_seen_time = 0.0           # monotonic time when we saw last candidate
-last_seen_equal = False        # whether last seen equals last_sent_plate
 next_read_ts = 0.0             # throttle OCR (monotonic time)
+BLOCK_TIMEOUT = 10.0
+last_sent_plate = ""
+last_sent_time = 0.0
 
 # Scan mode controlled by keys/buttons
 scan_mode = 'idle'
 
 # OCR aggregation "buckets"
-aggr_left  = {'samples': [], 'start_ts': 0.0, 'raw_counts': {}}
-aggr_right = {'samples': [], 'start_ts': 0.0, 'raw_counts': {}}
+aggr_left  = {'samples': [], 'start_ts': 0.0,
+              'streak_plate': '', 'streak_count': 0, 'streak_x': 0,
+              'valid_seen_set': set()}
+aggr_right = {'samples': [], 'start_ts': 0.0,
+              'streak_plate': '', 'streak_count': 0, 'streak_x': 0,
+              'valid_seen_set': set()}
 
 show_zones = True  # press 'z' to toggle at runtime
 
@@ -235,52 +256,6 @@ def force_mode(new_mode):
         print(f"Scan mode: "
               f"{scan_mode.upper() if scan_mode!='idle' else 'IDLE'}")
 
-# --------------------------- Similarity -------------------------------------
-def levenshtein(a, b):
-    """
-    Function: levenshtein
-    Purpose: Compute edit distance between strings a and b.
-    Methods: Dynamic programming over a matrix of size len(a) x len(b).
-    Creates: dp 2D list for distances, local indices i, j.
-    """
-    dp = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
-    for i in range(len(a) + 1):
-        dp[i][0] = i
-    for j in range(len(b) + 1):
-        dp[0][j] = j
-    for i in range(1, len(a) + 1):
-        for j in range(1, len(b) + 1):
-            cost = 0 if a[i - 1] == b[j - 1] else 1
-            dp[i][j] = min(
-                dp[i - 1][j] + 1,         # deletion
-                dp[i][j - 1] + 1,         # insertion
-                dp[i - 1][j - 1] + cost   # substitution
-            )
-    return dp[-1][-1]
-
-def is_partial_or_similar(a, b):
-    """
-    Function: is_partial_or_similar
-    Purpose: Decide if two plates are equal, very close, or partial.
-    Methods: Exact check, Levenshtein distance, prefix containment.
-    Creates: d distance int, min_len int, allow_drop int.
-    """
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    d = levenshtein(a, b)
-    if d <= SIMILAR_DISTANCE_MAX:
-        return True
-    min_len = min(len(a), len(b))
-    allow_drop = PARTIAL_MIN_MATCH_DROP
-    if a[:min_len - allow_drop] == b[:min_len - allow_drop]:
-        return True
-    if (a in b) or (b in a):
-        short = min(len(a), len(b))
-        overlap = min(len(a), len(b)) - allow_drop
-        return overlap >= (short - allow_drop)
-    return False
 
 # ---------------- Image preprocessing and OCR -------------------------------
 import subprocess
@@ -405,30 +380,62 @@ def ocr_plate(roi_bin):
     return txt.strip()
 
 
+def smart_swap(chars):
+    """
+    Function: smart_swap
+    Purpose: Replace 'O'->'0' and 'I'->'1' only when adjacent to
+    digits (disambiguation). Keep all other characters unchanged.
+    Methods: Inspect neighbors; conditionally swap; always append 'ch'.
+    Creates: 'out' list with all characters preserved.
+    """
+    out = []
+    for i, ch in enumerate(chars):
+        if ch in ("O", "I"):
+            left_d = (i > 0 and chars[i-1].isdigit())
+            right_d = (i + 1 < len(chars) and chars[i+1].isdigit())
+            if left_d or right_d:
+                ch = "0" if ch == "O" else "1"
+        out.append(ch)
+    return "".join(out)
+
+
 def normalize_plate(txt):
     """
     Function: normalize_plate
     Purpose: Clean up OCR text with minimal ambiguity fixes.
-    Methods: Upper-case, trim, remove spaces; O->0 and I->1 selectively.
-    Creates: s working string, allowed character set string.
+    Methods: Upper-case, trim, remove spaces; keep A-Z0-9 only;
+    then call smart_swap(...) to disambiguate O/I near digits.
+    Creates: returns normalized string (not None).
     """
     s = txt.upper().strip().replace(" ", "")
     allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     s = "".join(ch for ch in s if ch in allowed)
-
-    # Лёгкая замена: только O->0 и I->1 если окружены цифрами
-    def smart_swap(chars):
-        out = []
-        for i, ch in enumerate(chars):
-            if ch in ("O", "I"):
-                left_d  = (i > 0 and chars[i-1].isdigit())
-                right_d = (i+1 < len(chars) and chars[i+1].isdigit())
-                if left_d or right_d:
-                    ch = "0" if ch == "O" else "1"
-            out.append(ch)
-        return "".join(out)
-
     return smart_swap(s)
+
+
+def update_streak(bucket, plate, x):
+    """
+    Function: update_streak
+    Purpose: Count consecutive repeats of the same normalized plate,
+    even when confidence is low; remember the latest x and start_ts.
+    Methods: Compare with bucket['streak_plate']; bump/reset count;
+    set start_ts when the streak begins.
+    Creates: updates 'streak_*' fields and 'start_ts' if needed.
+    """
+    now = time.monotonic()
+    if not bucket['start_ts']:
+        bucket['start_ts'] = now
+    if not plate:
+        # Empty read breaks the streak softly
+        return
+    if plate == bucket['streak_plate']:
+        bucket['streak_count'] += 1
+    else:
+        bucket['streak_plate'] = plate
+        bucket['streak_count'] = 1
+    bucket['streak_x'] = int(x)
+    print(f"[streak] {bucket['streak_plate']} x{bucket['streak_count']} "
+            f"at x={bucket['streak_x']}")
 
 
 def pick_best_by_side(boxes, frame_width):
@@ -456,61 +463,40 @@ def pick_best_by_side(boxes, frame_width):
 def add_sample(bucket, plate, conf, x):
     """
     Function: add_sample
-    Purpose: Add a sample into the bucket; always bump raw frequency,
-    even when confidence is low. Keep 'samples' filtered by conf.
-    Methods: Set start_ts on the first sample; bump raw_counts[plate];
-    append to 'samples' only if conf >= MIN_SAMPLE_CONF.
-    Creates: tuples in 'samples': (plate, conf, x, ts); updates dict.
+    Purpose: Add an OCR sample into the bucket if confidence is OK.
+    Methods: Set start_ts on the first sample; append (plate, conf, x, ts)
+    when plate is non-empty and conf >= MIN_SAMPLE_CONF.
+    Creates: tuples in 'samples': (plate, conf, x, ts).
     """
     now = time.monotonic()
-    if not bucket['samples'] and not bucket['raw_counts']:
+    if not bucket['samples'] and not bucket['start_ts']:
         bucket['start_ts'] = now
-    # Bump raw frequency for normalized plate (non-empty only)
-    if plate:
-        cnt = bucket['raw_counts'].get(plate, 0)
-        bucket['raw_counts'][plate] = cnt + 1
-    # Keep confidence-filtered list for normal scoring
-    if (not plate) or (float(conf) < MIN_SAMPLE_CONF):
+    if not plate or float(conf) < MIN_SAMPLE_CONF:
         return
     bucket['samples'].append((plate, float(conf), int(x), now))
+    bucket['valid_seen_set'].add(plate)
 
 def choose_best(samples):
     """
     Function: choose_best
-    Purpose: From aggregated samples choose the best plate string.
-    Methods: Group by plate; score=avg_conf + 10*freq + length bonus.
-    Creates: dict per plate with freq, avg_conf, last_x; returns tuple.
+    Purpose: Choose the plate with the highest average confidence.
+    Methods: Aggregate by plate; compute avg_conf; pick max.
+    Creates: returns (best_plate, best_x, best_avg_conf).
     """
     if not samples:
-        return "", 0, 0.0, 0
+        return "", 0, 0.0
     stats = {}
     for plate, conf, x, ts in samples:
-        if not plate:
-            # Ignore empty reads; they do not help selection
-            continue
         s = stats.setdefault(plate, {'sum': 0.0, 'n': 0, 'x': x})
         s['sum'] += conf
         s['n'] += 1
-        s['x'] = x  # use the most recent x
-    if not stats:
-        return "", 0, 0.0, 0
-
-    best_plate, best_score, best_x = "", -1e9, 0
-    best_avg, best_n = 0.0, 0
+        s['x'] = x
+    best_plate, best_avg, best_x = "", -1.0, 0
     for p, s in stats.items():
-        avg_conf = s['sum'] / max(s['n'], 1)
-        freq = s['n']
-        L = len(p)
-        len_bonus = 5.0 if L in PREF_LEN_STRONG else \
-                    (2.5 if L in PREF_LEN_WEAK else 0.0)
-        score = avg_conf + 10.0 * freq + len_bonus
-        if score > best_score:
-            best_plate = p
-            best_score = score
-            best_x = s['x']
-            best_avg = avg_conf
-            best_n = freq
-    return best_plate, best_x, best_avg, best_n
+        avg = s['sum'] / max(s['n'], 1)
+        if avg > best_avg:
+            best_plate, best_avg, best_x = p, avg, s['x']
+    return best_plate, best_x, best_avg
 
 
 def is_valid_plate(plate: str) -> bool:
@@ -526,59 +512,54 @@ def is_valid_plate(plate: str) -> bool:
 def maybe_finalize(bucket, frame_width):
     """
     Function: maybe_finalize
-    Purpose: Finalize when enough samples or window passed; apply
-    strict filters; allow low-confidence override on repetition.
-    Methods: Count/window check; choose_best; strict AAA999 filters;
-    fallback: raw_counts >= LOW_CONF_SAME_COUNT -> send anyway.
+    Purpose: Finalize when enough samples or window passed; prefer the
+    normal path (confidence-filtered). If that fails, allow streak-based
+    override: send when the same valid plate repeated N times in a row.
+    Methods: Count/time window check; choose_best; strict AAA999 filters;
+    streak override; clear bucket before exit in all cases.
     Creates: Calls handle_candidate(); clears bucket afterwards.
     """
-    if not bucket['samples'] and not bucket['raw_counts']:
+    # Need either some samples or at least a started streak window
+    if not bucket['samples'] and not bucket['start_ts']:
         return
+
     now = time.monotonic()
     enough_count = (len(bucket['samples']) >= AGGR_MAX_SAMPLES)
     enough_time = ((now - bucket['start_ts']) >= AGGR_WINDOW)
     if not (enough_count or enough_time):
         return
 
-    # Normal path: score by confidence-filtered samples
-    plate, x, avg_conf, n = ("", 0, 0.0, 0)
+    # ---- Normal path: confidence-filtered best candidate ----
+    plate, x, avg_conf = ("", 0, 0.0)
     if bucket['samples']:
-        plate, x, avg_conf, n = choose_best(bucket['samples'])
+        plate, x, avg_conf = choose_best(bucket['samples'])
 
-    # Decide by strict filters first
-    def strict_ok(p, avg, nn):
+    # Strict AAA999
+    def strict_ok(p, avg):
         if not p:
             return False
         if not (MIN_FINAL_LEN[0] <= len(p) <= MIN_FINAL_LEN[1]):
             return False
-        letters = sum(ch.isalpha() for ch in p)
-        digits = sum(ch.isdigit() for ch in p)
-        if not (letters == 3 and digits == 3):  # exact AAA999
-            return False
-        if (avg < MIN_FINAL_CONF) or (nn < MIN_FINAL_SAMPLES):
-            return False
-        return True
+        return bool(RE_PLATE.fullmatch(p)) and (avg >= MIN_FINAL_CONF)
 
-    # If strict path succeeds -> send; else try low-conf override
-    if strict_ok(plate, avg_conf, n):
+    if strict_ok(plate, avg_conf):
         clear_aggr(bucket)
         handle_candidate(plate, x, frame_width)
         return
 
-    # ---- Low-confidence override based on raw repetition ----
-    if LOW_CONF_OVERRIDE_ENABLED:
-        # Pick the most frequent valid AAA999 in raw_counts
-        best_raw_plate, best_raw_count = "", 0
-        best_raw_x = x  # reuse latest x if unknown
-        for p, c in bucket['raw_counts'].items():
-            if c > best_raw_count and is_valid_plate(p):
-                best_raw_plate, best_raw_count = p, c
-        if best_raw_plate and best_raw_count >= LOW_CONF_SAME_COUNT:
-            clear_aggr(bucket)
-            handle_candidate(best_raw_plate, best_raw_x, frame_width)
-            return
+    # ---- Streak override: same normalized plate repeated N times ----
+    if LOW_CONF_STREAK_ENABLED:
+        sp = bucket.get('streak_plate', '')
+        sc = int(bucket.get('streak_count', 0))
+        sx = int(bucket.get('streak_x', 0))
+        if sp and RE_PLATE.fullmatch(sp) and (sc >= LOW_CONF_STREAK_N):
+            if (not REQUIRE_ONE_VALID_SAMPLE_FOR_STREAK) or \
+            (sp in bucket.get('valid_seen_set', set())):
+                clear_aggr(bucket)
+                handle_candidate(sp, sx, frame_width)
+                return
 
-    # Nothing qualified -> clear and do nothing
+    # ---- Neither path qualified: clear and do nothing ----
     clear_aggr(bucket)
 
 
@@ -650,7 +631,6 @@ def draw_zones(vis):
 
 
 # -------------------- Server interaction -----------------------------------
-
 def send_plate_event(plate, x, frame_width):
     """
     Function: send_plate_event
@@ -706,113 +686,40 @@ def send_plate_event(plate, x, frame_width):
         print(f"Request failed: {e}")
 
 # --------------------- Anti-spam helpers -----------------------------------
-def start_block(plate):
-    """
-    Function: start_block
-    Purpose: Begin a 10 s block window after sending 'plate'.
-    Methods: Fill global vars with current monotonic time.
-    Creates: block_active, block_deadline, last_* globals.
-    """
-    global block_active, block_deadline
-    global last_sent_plate, last_seen_plate, last_seen_x
-    global last_seen_time, last_seen_equal
-    now = time.monotonic()
-    last_sent_plate = plate
-    block_active = True
-    block_deadline = now + SIMILAR_TIMEOUT
-    last_seen_plate = plate
-    last_seen_x = 0
-    last_seen_time = now
-    last_seen_equal = True
-
 def handle_candidate(candidate, x, frame_width):
     """
     Function: handle_candidate
-    Purpose: Decide sending vs waiting for a 'candidate' plate.
-    Methods: if/else using global block state; start_block().
-    Creates: updates last_seen_*; calls send_plate_event when allowed.
+    Purpose: Simple anti-spam: do not resend the same plate within
+    BLOCK_TIMEOUT seconds; otherwise send immediately.
+    Methods: Compare candidate vs last_sent_plate and time delta;
+    call send_plate_event(); update globals.
+    Creates: updates last_sent_*.
     """
-    global block_active, last_seen_plate, last_seen_x
-    global last_seen_time, last_seen_equal, last_sent_plate
+    global last_sent_plate, last_sent_time
     now = time.monotonic()
-    # Update what we currently see
-    last_seen_plate = candidate
-    last_seen_x = x
-    last_seen_time = now
-    last_seen_equal = (candidate == last_sent_plate)
-    # If no block -> send immediately and start block
-    if (not block_active) or (not last_sent_plate):
-        send_plate_event(candidate, x, frame_width)
-        start_block(candidate)
+
+    if candidate == last_sent_plate and (now - last_sent_time) < BLOCK_TIMEOUT:
         return
-    # In block: exact same plate -> wait (do not resend)
-    if last_seen_equal:
-        return
-    # In block: similar/partial but different -> hold till timeout
-    if is_partial_or_similar(candidate, last_sent_plate):
-        return
-    # In block: different enough -> send immediately and start new block
+
+    print(f"The plate location is {x}")
     send_plate_event(candidate, x, frame_width)
-    start_block(candidate)
-
-def check_timeout(frame_width):
-    """
-    Function: check_timeout
-    Purpose: Decide what to do at/after anti-spam deadline.
-             - If the SAME plate is still present, do NOT resend; show
-               "please move on!" and RE-ARM the block for another
-               SIMILAR_TIMEOUT window.
-             - If a similar/partial BUT DIFFERENT plate is present,
-               send it now and start a new block.
-             - Otherwise, simply end the block.
-    Methods: Compare 'now' vs 'block_deadline'; inspect last_seen_* and
-             last_sent_plate; call send_plate_event/start_block when needed.
-    Creates: May keep 'block_active' True (re-arm) or set it False;
-             may emit one send when a new similar plate showed up.
-    """
-    global block_active, block_deadline, last_seen_time
-    global last_seen_plate, last_seen_x, last_seen_equal
-    global last_sent_plate
-    if not block_active:
-        return
-    now = time.monotonic()
-    if now < block_deadline:
-        return
-
-    # === We are at/after the deadline ===
-    # Case 1: The exact same plate is still visible -> suppress resend,
-    # show message, and re-arm the block for another timeout window.
-    if last_seen_equal and ((now - last_seen_time) <= READ_PERIOD):
-        if last_sent_plate:
-            print(f"{last_sent_plate}, please move on!")
-        # Re-arm the anti-spam block instead of ending it.
-        block_deadline = now + SIMILAR_TIMEOUT
-        block_active = True
-        return
-
-    # Case 2: A similar/partial but different plate is visible -> send now
-    if (last_seen_plate and
-        is_partial_or_similar(last_seen_plate, last_sent_plate) and
-        (last_seen_plate != last_sent_plate)):
-        send_plate_event(last_seen_plate, last_seen_x, frame_width)
-        start_block(last_seen_plate)
-        return
-
-    # Case 3: Nothing relevant -> end the block
-    block_active = False
+    last_sent_plate = candidate
+    last_sent_time = now
 
 # -------------------- Multi-OCR aggregation --------------------------------
 def clear_aggr(bucket):
     """
     Function: clear_aggr
     Purpose: Reset aggregation bucket to empty state.
-    Methods: Clear list and zero start_ts.
-    Creates: empties 'samples', sets 'start_ts' to 0.
+    Methods: Clear list and zero start_ts; reset streak fields.
+    Creates: empties 'samples', sets 'start_ts' to 0; clears streak.
     """
     bucket['samples'].clear()
     bucket['start_ts'] = 0.0
-    bucket['raw_counts'].clear()
-
+    bucket['streak_plate'] = ''
+    bucket['streak_count'] = 0
+    bucket['streak_x'] = 0
+    bucket['valid_seen_set'].clear()
 
 # -------------------- Scan mode handling -----------------------------------
 def toggle_mode(new_mode):
@@ -905,16 +812,16 @@ def main():
                 if scan_mode == 'exit' and best_left:
                     p, conf, px = ocr_bbox(frame, best_left)
                     if p:
+                        update_streak(aggr_left, p, px)
                         add_sample(aggr_left, p, conf, px)
                     maybe_finalize(aggr_left, frame.shape[1])
 
                 if scan_mode == 'enter' and best_right:
                     p, conf, px = ocr_bbox(frame, best_right)
                     if p:
+                        update_streak(aggr_right, p, px)
                         add_sample(aggr_right, p, conf, px)
                     maybe_finalize(aggr_right, frame.shape[1])
-
-                check_timeout(frame.shape[1])
 
             # Draw boxes/labels every frame
             vis = frame.copy()
