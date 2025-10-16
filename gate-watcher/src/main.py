@@ -775,8 +775,8 @@ def main():
     prev_state = (None, None)
 
     # Camera picture settings
-    brightness = 128
-    contrast = 128
+    brightness = 58
+    contrast = 148
     gain = 128
 
     # OCR area settings
