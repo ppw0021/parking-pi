@@ -1,0 +1,9 @@
+# bay_calibrator flask app
+uv run python bay_calibrator.py
+
+#send bay instructions
+change print(json.dumps(spots_data, indent=2))
+to requests.post(url, json=spots_data)
+
+#run send bay status
+uv run python send_bay_status_dev.py
