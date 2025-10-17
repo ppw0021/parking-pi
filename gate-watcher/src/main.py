@@ -1,157 +1,291 @@
-import requests
-import servo # servo.py
-from time import sleep
-
 '''
-GateWatcher:
+GateWatcher v0.0.7 (20251016-1550):
 The code monitors the gates of a parking lot.
 If a license plate is detected on the right part of the creen,
 It means a car is entering, so the code will issue a call to the server:
-    URL/enter/<plate>
+ URL/enter/<plate>
 The server will reply with one of a following status_codes:
-    110 - if the car was added correctly to the database.
-    111 - if failed, e.g. car is already in the carpark.
-
+ 210 - if the car was added correctly to the database.
+ 211 - if failed, e.g. car is already in the carpark.
 If the plate is detected on the left part of the screen,
 It means the car is exiting the parking lot, so the call will be:
-    URL/exit/<plate>
+ URL/exit/<plate>
 The server will reply with one of the following status_codes:
-    120 - if the fees for the parking were paid for this car
-    121 - if the fees for the parking were NOT paid for this car
-    122 - if any error occured
-
+ 210 - if the fees for the parking were paid for this car
+ 211 - if the fees for the parking were NOT paid for this car
+ 212 - if any error occured
+v0.0.3:
 Antispam feature added:
-    Read OCR every 500 milliseconds
-    Block similar/partial re-sends for 10 seconds after last send
-    If still the same number after timeout - print "{plate}, please move on"
-    If after timeout the number is similar - send the new plate
+ Read OCR every 500 milliseconds
+ Block similar/partial re-sends for 10 seconds after last send
+ If still the same number after timeout -> "{plate}, please move on"
+ If after timeout the number is similar -> send the new plate
+v0.0.5:
+ - 'e' toggles ENTER-only scanning (right side).
+ - 'x' toggles EXIT-only scanning (left side).
+ - GPIO4 grounded: Entrance waiting
+ - GPIO14 grounded: Exit waiting
+ - Multi-sample OCR filter picks the best plate over a short window.
+v0.0.7, Spring cleaning:
+Removed:
+ - levenshtein(...)
+ - is_partial_or_similar
+ - SIMILAR_DISTANCE_MAX
+ - PARTIAL_MIN_MATCH_DROP
+ - block_active, block_deadline, last_seen_plate, last_seen_x, last_seen_time, last_seen_equal
+ - start_block(...)
+ - check_timeout(...)
+ - LOW_CONF_OVERRIDE_ENABLED
+ - LOW_CONF_SAME_COUNT
+ - raw_counts
+ - len_bonus calculation
+ - PREF_LEN_STRONG
+ - PREF_LEN_WEAK 
+
+Added:
+ - BLOCK_TIMEOUT
+
+Changed:
+ - aggr_left + aggr_right
+ - clear_aggr(...)
+ - add_sample(...)
+ - choose_best(...)
+ - maybe_finalize(...)
+ - handle_candidate(...)
+ - main(...):
+ -- check_timeout(...)
+
 '''
-
-# Replace with your target IP (and include http:// or https://)
-url = "http://127.0.0.1:5000"
-
-try:
-    plate = "54"
-    uri = url + "/exit/" + plate
-    response = requests.get(uri, timeout=5)
-    print(f"Status code: {response.status_code}")
-
-    if (response.status_code == 201):
-        print("Customer has paid, open the gate")
-        # customer has paid open the gates, blink LED whatever
-    elif (response.status_code == 202):
-        print("Customer has not paid, do not open gate")
-        # Customer has not paid, blink red LED
-except requests.exceptions.RequestException as e:
-    print(f"Request failed: {e}")
-
-
-# Open Gates
-servo.set_gate(0, False)  # Open gate 0 (Entry gate)
-servo.set_gate(1, False)  # Open gate 1 (Exit gate)
-sleep(3)
-
-#Close Gates
-servo.set_gate(0, True)   # Close gate 0 (Entry gate)
-servo.set_gate(1, True)   # Close gate 1 (Exit gate)
+import requests
+import servo  # servo.py
+from time import sleep
 import cv2
 import numpy as np
 import pytesseract
-import requests
+from pytesseract import Output
 import time
 from datetime import datetime
+import re
+
+
+# --- NEW: GPIO + Sense HAT --------------------------------------------------
+import RPi.GPIO as GPIO
+from sense_hat import SenseHat
+
+# Open Gates
+# servo.set_gate(0, False) # Open gate 0 (Entry gate)
+# servo.set_gate(1, False) # Open gate 1 (Exit gate)
+# sleep(1)
+# Close Gates
+# servo.set_gate(0, True)  # Close gate 0 (Entry gate)
+# servo.set_gate(1, True)  # Close gate 1 (Exit gate)
 
 # ---- Configuration ---------------------------------------------------------
-
-CAMERA_INDEX = 0                 # Ususaly '0' for the first connected camera
+# Replace with your target IP (and include http:// or https://)
+url = "http://127.0.0.1:5000"
+CAMERA_INDEX = 0  # Ususaly '0' for the first connected camera
 WEB_PI_IP = "http://127.0.0.1"  # Holds the IP of the web server pi
-URL = f"{WEB_PI_IP}:5000"        # Holds the full address of the server
+URL = f"{WEB_PI_IP}:5000"  # Holds the full address of the server
+ASPECT_MIN = 2.0 #
+ASPECT_MAX = 6.0 #
+MAX_CANDIDATES = 10 #
+PRINT_ALL_OCR = True #
 
-MIN_AREA = 2000              # 
-ASPECT_MIN = 2.0             # 
-ASPECT_MAX = 6.0             # 
-MAX_CANDIDATES = 6           # 
-TESS_CFG = "--oem 1 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-PRINT_ALL_OCR = True
 
 # OCR constants:
-EXIT_ZONE_X_LIMIT  = 0.4     # 
-ENTER_ZONE_X_LIMIT = 0.6     # 
+EXIT_ZONE_X_LIMIT = 0.52  # Left side -> Exit
+ENTER_ZONE_X_LIMIT = 0.58 # Right side -> Entrance
+RE_PLATE = re.compile(r'^[A-Z]{3}\d{3}$')
+REQUIRE_ONE_VALID_SAMPLE_FOR_STREAK = False
+
+# Tesseract configuration:
+TESS_CFG = "--oem 1 --psm 7 -c " \
+           "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+MIN_SAMPLE_CONF = 40.0   # Tesseract confidence threshold
+MIN_FINAL_CONF  = 50.0   # Minimal average confidence to be sent
+MIN_FINAL_LEN   = (6, 6) # Allowed length range for acceptable string
+MIN_FINAL_SAMPLES = 2    # Need >=2 valid readings
+
+# Image processing
+AREA_MIN  = 2000
+AREA_MAX  = 5000
+AREA_STEP = 1000
+AREA_ABS_MIN = 200
+area_min  = AREA_MIN
+area_max  = AREA_MAX
+
+# Camera Constants
+CAMERA_RESOLUTION = (1280, 720)  # or (1920, 1080), (640, 480)
 
 # Anti-Spam controls:
-READ_PERIOD = 0.5            # seconds, 2 Hz OCR/evaluation
-SIMILAR_TIMEOUT = 10.0       # seconds to block similar/partial plates
-SIMILAR_DISTANCE_MAX = 1     # Levenshtein distance threshold
-PARTIAL_MIN_MATCH_DROP = 1   # Allow one missing char in a prefix match
+READ_PERIOD = 0.5              # seconds, 2 Hz OCR/evaluation
+SIMILAR_TIMEOUT = 10.0         # seconds to block similar/partial plates
 
-READ_PERIOD = 0.5           # seconds, 2 Hz OCR/evaluation
-SIMILAR_TIMEOUT = 10.0      # seconds to block similar/partial plates
-SIMILAR_DISTANCE_MAX = 1    # Levenshtein distance threshold
-PARTIAL_MIN_MATCH_DROP = 1  # Allow one missing char in a prefix match
+# Multi-OCR aggregation controls:
+AGGR_MAX_SAMPLES = 5           # collect up to N OCR samples
+AGGR_WINDOW = 1.1              # or until this many seconds pass
+
+# Allow sending when the same normalized plate repeats in a streak
+LOW_CONF_STREAK_ENABLED = True
+LOW_CONF_STREAK_N = 3  # send even if confidence is low
+
+# HW Constants
+GPIO_STABLE_MS = 300           # 300 mSec jitter prevention
 
 # Global Anti-spam state variables:
-last_sent_plate = ""        # last plate sent to server
-block_active = False        # are we in 10 s block window?
-block_deadline = 0.0        # monotonic deadline when block expires
+last_sent_plate = ""           # last plate sent to server
+next_read_ts = 0.0             # throttle OCR (monotonic time)
+BLOCK_TIMEOUT = 10.0
+last_sent_plate = ""
+last_sent_time = 0.0
 
-last_seen_plate = ""        # most recently observed candidate
-last_seen_x = 0             # x coordinate of last seen candidate
-last_seen_time = 0.0        # monotonic time when we saw last candidate
-last_seen_equal = False     # whether last seen equals last_sent_plate
+# Scan mode controlled by keys/buttons
+scan_mode = 'idle'
 
-next_read_ts = 0.0          # throttle OCR (monotonic time)
+# OCR aggregation "buckets"
+aggr_left  = {'samples': [], 'start_ts': 0.0,
+              'streak_plate': '', 'streak_count': 0, 'streak_x': 0,
+              'valid_seen_set': set()}
+aggr_right = {'samples': [], 'start_ts': 0.0,
+              'streak_plate': '', 'streak_count': 0, 'streak_x': 0,
+              'valid_seen_set': set()}
+
+show_zones = True  # press 'z' to toggle at runtime
+
+# --- GPIO pins and LED arrow patterns ---------------------------------------
+PIN_ENTER = 14   # BCM 14 -> Enter (Up arrow)
+PIN_EXIT  = 4    # BCM 4  -> Exit  (Down arrow)
+DEBOUNCE_SEC = 0.05
+
+RED  = (255, 0,   0)
+BLUE = (0,   0, 255)
+BLK  = (0,   0,   0)
+
+UP_RED = [
+    "00000000",
+    "00r00000",
+    "0rrr0000",
+    "00r00000",
+    "00r00000",
+    "00r00000",
+    "00r00000",
+    "00000000",
+]
+
+DOWN_BLUE = [
+    "00000000",
+    "00000b00",
+    "00000b00",
+    "00000b00",
+    "00000b00",
+    "0000bbb0",
+    "00000b00",
+    "00000000",
+]
+
+BOTH = [
+    "00000000",
+    "00r00b00",
+    "0rrr0b00",
+    "00r00b00",
+    "00r00b00",
+    "00r0bbb0",
+    "00r00b00",
+    "00000000",
+]
 
 # ---- Functions -------------------------------------------------------------
-# -------- Similarity --------------------------------------------------------
-
-def levenshtein(a, b):
+# -------- GPIO handling -----------------------------------------------------
+def pattern_to_pixels(pat):
     """
-    Function: levenshtein
-    Purpose: Compute edit distance between strings a and b.
-    Methods: Dynamic programming over a matrix of size len(a) x len(b).
-    Creates: dp 2D list for distances, local indices i, j.
+    Function: pattern_to_pixels
+    Purpose: Convert 8x8 char pattern into a list of 64 RGB tuples.
+    Methods: Iterate rows/cols; map 'r'->RED, 'b'->BLUE, otherwise BLK.
+    Creates: 'pix' list of tuples (R,G,B).
     """
-    dp = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
-    for i in range(len(a) + 1):
-        dp[i][0] = i
-    for j in range(len(b) + 1):
-        dp[0][j] = j
-    for i in range(1, len(a) + 1):
-        for j in range(1, len(b) + 1):
-            cost = 0 if a[i - 1] == b[j - 1] else 1
-            dp[i][j] = min(
-                dp[i - 1][j] + 1,       # deletion
-                dp[i][j - 1] + 1,       # insertion
-                dp[i - 1][j - 1] + cost # substitution
-            )
-    return dp[-1][-1]
+    pix = []
+    for row in pat:
+        for ch in row:
+            if ch == 'r':
+                pix.append(RED)
+            elif ch == 'b':
+                pix.append(BLUE)
+            else:
+                pix.append(BLK)
+    return pix
+
+def show_arrows(sense, enter_low, exit_low):
+    """
+    Function: show_arrows
+    Purpose: Display arrows on Sense HAT based on GPIO state.
+    Methods: Choose UP/DOWN/BOTH; call sense.set_pixels(); clear if none.
+    Creates: local 'pixels' list when any input is active.
+    """
+    if enter_low and exit_low:
+        sense.set_pixels(pattern_to_pixels(BOTH))
+    elif exit_low:
+        sense.set_pixels(pattern_to_pixels(DOWN_BLUE))
+    elif enter_low:
+        sense.set_pixels(pattern_to_pixels(UP_RED))
+    else:
+        sense.clear()
+
+def read_gpio_state():
+    """
+    Function: read_gpio_state
+    Purpose: Sample GPIO pins and return booleans (enter_low, exit_low).
+    Methods: GPIO.input() with pull-ups; LOW means grounded/active.
+    Creates: two bools.
+    """
+    enter_low = (GPIO.input(PIN_ENTER) == GPIO.LOW)
+    exit_low  = (GPIO.input(PIN_EXIT)  == GPIO.LOW)
+    return enter_low, exit_low
+
+def force_mode(new_mode):
+    """
+    Function: force_mode
+    Purpose: Deterministically set scan_mode, clear aggregators on change.
+    Methods: Assign 'scan_mode' and reset aggr_left/aggr_right.
+    Creates: updates global scan_mode; prints mode banner.
+    """
+    global scan_mode, aggr_left, aggr_right
+    if scan_mode != new_mode:
+        scan_mode = new_mode
+        clear_aggr(aggr_left)
+        clear_aggr(aggr_right)
+        print(f"Scan mode: "
+              f"{scan_mode.upper() if scan_mode!='idle' else 'IDLE'}")
 
 
-def is_partial_or_similar(a, b):
-    """
-    Function: is_partial_or_similar
-    Purpose: Decide if two plates are equal, very close, or partial.
-    Methods: Exact check, Levenshtein distance, prefix containment.
-    Creates: d distance int, min_len int, allow_drop int.
-    """
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    d = levenshtein(a, b)
-    if d <= SIMILAR_DISTANCE_MAX:
-        return True
-    min_len = min(len(a), len(b))
-    allow_drop = PARTIAL_MIN_MATCH_DROP
-    if a[:min_len - allow_drop] == b[:min_len - allow_drop]:
-        return True
-    if (a in b) or (b in a):
-        short = min(len(a), len(b))
-        overlap = min(len(a), len(b)) - allow_drop
-        return overlap >= (short - allow_drop)
-    return False
+# ---------------- Image preprocessing and OCR -------------------------------
+import subprocess
 
-# -------- Image preprocessing and OCR ---------------------------------------
+
+def set_brightness(value):
+    value = max(0, min(255, value))
+    subprocess.call([
+        "v4l2-ctl", "--device=/dev/video0", "--set-ctrl", f"brightness={value}"
+    ])
+    print(f"Яркость: {value}")
+    return value
+
+def set_contrast(value):
+    value = max(0, min(255, value))
+    subprocess.call([
+        "v4l2-ctl", "--device=/dev/video0", "--set-ctrl", f"contrast={value}"
+    ])
+    print(f"Контраст: {value}")
+    return value
+
+def set_gain(value):
+    value = max(0, min(255, value))
+    subprocess.call([
+        "v4l2-ctl", "--device=/dev/video0", "--set-ctrl", f"gain={value}"
+    ])
+    print(f"Gain: {value}")
+    return value
+
+
 def preprocess_roi(roi_bgr):
     """
     Function: preprocess_roi
@@ -162,8 +296,9 @@ def preprocess_roi(roi_bgr):
     gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
     filt = cv2.bilateralFilter(gray, 7, 25, 25)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    eq = clahe.apply(filt)
-    _, th = cv2.threshold(eq, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY)
+    _, th = cv2.threshold(
+        clahe.apply(filt), 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY
+    )
     return th
 
 
@@ -171,29 +306,68 @@ def find_plate_candidates(frame_bgr):
     """
     Function: find_plate_candidates
     Purpose: Detect rectangular regions that may contain a plate.
-    Methods: Gray, blur, Canny edges, dilate, contours, aspect filter.
+    Methods: Gray, blur, Canny edges, dilate, contours, aspect filter,
+             binary mask for black-on-white text.
     Creates: edges image, cnts list, boxes list of (x, y, w, h).
     """
+    # 50 shades of Grey
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, 80, 200)
+
+    # Blurring to remove the noise
+    # gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Implementing binary mask: Search for black-on-white text
+    _, binary_mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+
+    # Combining the mask with the original image
+    combined = cv2.bitwise_and(gray, binary_mask)
+
+    # highlighting the boundaries
+    edges = cv2.Canny(combined, 80, 200)
+
+    # Expanding boudaries
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     edges = cv2.dilate(edges, k, iterations=1)
+
+    # Searching for contours
     cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     boxes = []
     for c in cnts:
         area = cv2.contourArea(c)
-        if area < MIN_AREA:
+        if area < area_min or area > area_max:
             continue
         x, y, w, h = cv2.boundingRect(c)
         aspect = w / max(h, 1)
         if ASPECT_MIN <= aspect <= ASPECT_MAX:
             boxes.append((x, y, w, h))
 
+    # Sorting by area, returning the best candidates
     boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
     return boxes[:MAX_CANDIDATES]
 
+
+def ocr_text_and_conf(img_bin):
+    """
+    Function: ocr_text_and_conf
+    Purpose: Run Tesseract OCR and return text with avg confidence.
+    Methods: pytesseract.image_to_data with Output.DICT; average conf.
+    Creates: data dict, confs list, avg_conf float, raw string.
+    """
+    data = pytesseract.image_to_data(
+        img_bin, config=TESS_CFG, output_type=Output.DICT
+    )
+    confs = []
+    for c in data.get('conf', []):
+        try:
+            v = int(c)
+            if v >= 0:
+                confs.append(v)
+        except ValueError:
+            continue
+    avg_conf = float(sum(confs)) / max(len(confs), 1)
+    raw = " ".join([w for w in data.get('text', []) if w.strip()])
+    return raw, avg_conf
 
 def ocr_plate(roi_bin):
     """
@@ -206,18 +380,63 @@ def ocr_plate(roi_bin):
     return txt.strip()
 
 
+def smart_swap(chars):
+    """
+    Function: smart_swap
+    Purpose: Replace 'O'->'0' and 'I'->'1' only when adjacent to
+    digits (disambiguation). Keep all other characters unchanged.
+    Methods: Inspect neighbors; conditionally swap; always append 'ch'.
+    Creates: 'out' list with all characters preserved.
+    """
+    out = []
+    for i, ch in enumerate(chars):
+        if ch in ("O", "I"):
+            left_d = (i > 0 and chars[i-1].isdigit())
+            right_d = (i + 1 < len(chars) and chars[i+1].isdigit())
+            if left_d or right_d:
+                ch = "0" if ch == "O" else "1"
+        out.append(ch)
+    return "".join(out)
+
+
 def normalize_plate(txt):
     """
     Function: normalize_plate
-    Purpose: Clean up OCR text and unify common confusions.
-    Methods: Upper-case, trim, remove spaces, O->0, I->1, Z->2, S->5, B->8.
-    Creates: s working string, allowed character set string.
+    Purpose: Clean up OCR text with minimal ambiguity fixes.
+    Methods: Upper-case, trim, remove spaces; keep A-Z0-9 only;
+    then call smart_swap(...) to disambiguate O/I near digits.
+    Creates: returns normalized string (not None).
     """
     s = txt.upper().strip().replace(" ", "")
-    s = s.replace("O", "0").replace("I", "1").replace("Z", "2")
-    s = s.replace("S", "5").replace("B", "8")
     allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    return "".join(ch for ch in s if ch in allowed)
+    s = "".join(ch for ch in s if ch in allowed)
+    return smart_swap(s)
+
+
+def update_streak(bucket, plate, x):
+    """
+    Function: update_streak
+    Purpose: Count consecutive repeats of the same normalized plate,
+    even when confidence is low; remember the latest x and start_ts.
+    Methods: Compare with bucket['streak_plate']; bump/reset count;
+    set start_ts when the streak begins.
+    Creates: updates 'streak_*' fields and 'start_ts' if needed.
+    """
+    now = time.monotonic()
+    if not bucket['start_ts']:
+        bucket['start_ts'] = now
+    if not plate:
+        # Empty read breaks the streak softly
+        return
+    if plate == bucket['streak_plate']:
+        bucket['streak_count'] += 1
+    else:
+        bucket['streak_plate'] = plate
+        bucket['streak_count'] = 1
+    bucket['streak_x'] = int(x)
+    print(f"[streak] {bucket['streak_plate']} x{bucket['streak_count']} "
+            f"at x={bucket['streak_x']}")
+
 
 def pick_best_by_side(boxes, frame_width):
     """
@@ -227,10 +446,13 @@ def pick_best_by_side(boxes, frame_width):
     Methods: Filter by x, sort by area, pick first per side.
     Creates: best_left, best_right tuples (x, y, w, h) or None.
     """
-    left_zone = [b for b in boxes if b[0] < frame_width * EXIT_ZONE_X_LIMIT]
-    right_zone = [b for b in boxes if b[0] > frame_width * ENTER_ZONE_X_LIMIT6]
+    left_zone = [b for b in boxes
+                 if b[0] < frame_width * EXIT_ZONE_X_LIMIT]
+    right_zone = [b for b in boxes
+                  if b[0] > frame_width * ENTER_ZONE_X_LIMIT]
 
     def area(b): return b[2] * b[3]
+
     left_zone.sort(key=area, reverse=True)
     right_zone.sort(key=area, reverse=True)
 
@@ -238,156 +460,327 @@ def pick_best_by_side(boxes, frame_width):
     best_right = right_zone[0] if right_zone else None
     return best_left, best_right
 
-# -------- Server interaction ------------------------------------------------
+def add_sample(bucket, plate, conf, x):
+    """
+    Function: add_sample
+    Purpose: Add an OCR sample into the bucket if confidence is OK.
+    Methods: Set start_ts on the first sample; append (plate, conf, x, ts)
+    when plate is non-empty and conf >= MIN_SAMPLE_CONF.
+    Creates: tuples in 'samples': (plate, conf, x, ts).
+    """
+    now = time.monotonic()
+    if not bucket['samples'] and not bucket['start_ts']:
+        bucket['start_ts'] = now
+    if not plate or float(conf) < MIN_SAMPLE_CONF:
+        return
+    bucket['samples'].append((plate, float(conf), int(x), now))
+    bucket['valid_seen_set'].add(plate)
+
+def choose_best(samples):
+    """
+    Function: choose_best
+    Purpose: Choose the plate with the highest average confidence.
+    Methods: Aggregate by plate; compute avg_conf; pick max.
+    Creates: returns (best_plate, best_x, best_avg_conf).
+    """
+    if not samples:
+        return "", 0, 0.0
+    stats = {}
+    for plate, conf, x, ts in samples:
+        s = stats.setdefault(plate, {'sum': 0.0, 'n': 0, 'x': x})
+        s['sum'] += conf
+        s['n'] += 1
+        s['x'] = x
+    best_plate, best_avg, best_x = "", -1.0, 0
+    for p, s in stats.items():
+        avg = s['sum'] / max(s['n'], 1)
+        if avg > best_avg:
+            best_plate, best_avg, best_x = p, avg, s['x']
+    return best_plate, best_x, best_avg
+
+
+def is_valid_plate(plate: str) -> bool:
+    """
+    Function: is_valid_plate
+    Purpose: Enforce exact AAA999 pattern before any send.
+    Methods: Regex match against RE_PLATE.
+    Creates: None.
+    """
+    return bool(RE_PLATE.fullmatch(plate))
+
+
+def maybe_finalize(bucket, frame_width):
+    """
+    Function: maybe_finalize
+    Purpose: Finalize when enough samples or window passed; prefer the
+    normal path (confidence-filtered). If that fails, allow streak-based
+    override: send when the same valid plate repeated N times in a row.
+    Methods: Count/time window check; choose_best; strict AAA999 filters;
+    streak override; clear bucket before exit in all cases.
+    Creates: Calls handle_candidate(); clears bucket afterwards.
+    """
+    # Need either some samples or at least a started streak window
+    if not bucket['samples'] and not bucket['start_ts']:
+        return
+
+    now = time.monotonic()
+    enough_count = (len(bucket['samples']) >= AGGR_MAX_SAMPLES)
+    enough_time = ((now - bucket['start_ts']) >= AGGR_WINDOW)
+    if not (enough_count or enough_time):
+        return
+
+    # ---- Normal path: confidence-filtered best candidate ----
+    plate, x, avg_conf = ("", 0, 0.0)
+    if bucket['samples']:
+        plate, x, avg_conf = choose_best(bucket['samples'])
+
+    # Strict AAA999
+    def strict_ok(p, avg):
+        if not p:
+            return False
+        if not (MIN_FINAL_LEN[0] <= len(p) <= MIN_FINAL_LEN[1]):
+            return False
+        return bool(RE_PLATE.fullmatch(p)) and (avg >= MIN_FINAL_CONF)
+
+    if strict_ok(plate, avg_conf):
+        clear_aggr(bucket)
+        handle_candidate(plate, x, frame_width)
+        return
+
+    # ---- Streak override: same normalized plate repeated N times ----
+    if LOW_CONF_STREAK_ENABLED:
+        sp = bucket.get('streak_plate', '')
+        sc = int(bucket.get('streak_count', 0))
+        sx = int(bucket.get('streak_x', 0))
+        if sp and RE_PLATE.fullmatch(sp) and (sc >= LOW_CONF_STREAK_N):
+            if (not REQUIRE_ONE_VALID_SAMPLE_FOR_STREAK) or \
+            (sp in bucket.get('valid_seen_set', set())):
+                clear_aggr(bucket)
+                handle_candidate(sp, sx, frame_width)
+                return
+
+    # ---- Neither path qualified: clear and do nothing ----
+    clear_aggr(bucket)
+
+
+# ----------- OCR on bbox (with confidence) ---------------------------------
+def ocr_bbox(frame, box):
+    """
+    Function: ocr_bbox
+    Purpose: Run OCR on a single bbox and normalize the text; also
+    compute OCR confidence and print side based on zone thresholds.
+    Methods: crop, resize, preprocess_roi, ocr_text_and_conf, normalize;
+    side='L' if x in EXIT zone, 'R' if in ENTER zone, else 'C'.
+    Creates: plate strings; conf float; px int.
+    """
+    (x, y, w, h) = box
+    roi = frame[y:y + h, x:x + w]
+    roi = cv2.resize(roi, None, fx=2.0, fy=2.0,
+                     interpolation=cv2.INTER_CUBIC)
+    th = preprocess_roi(roi)
+    raw, conf = ocr_text_and_conf(th)
+    plate = normalize_plate(raw)
+
+    if PRINT_ALL_OCR:
+        fw = frame.shape[1]
+        if x < fw * EXIT_ZONE_X_LIMIT:
+            side = 'L'   # Exit zone (left)
+        elif x > fw * ENTER_ZONE_X_LIMIT:
+            side = 'R'   # Enter zone (right)
+        else:
+            side = 'C'   # Middle (ignored)
+        print(f"[side {side}] raw={raw!r} norm={plate!r} conf={conf:.1f}")
+
+    return plate, conf, x
+
+
+def draw_zones(vis):
+    """
+    Function: draw_zones
+    Purpose: Draw EXIT/ENTER vertical borders and shaded regions.
+    Methods: Compute pixel x from relative limits; draw lines and overlays.
+    Creates: no state, draws on 'vis' in-place.
+    """
+    h, w = vis.shape[:2]
+    x_exit = int(w * EXIT_ZONE_X_LIMIT)
+    x_enter = int(w * ENTER_ZONE_X_LIMIT)
+
+    # semi-transparent shading for zones
+    overlay = vis.copy()
+    # left (exit) zone in cyan-ish
+    cv2.rectangle(overlay, (0, 0), (x_exit, h), (255, 255, 0), -1)
+    # right (enter) zone in green-ish
+    cv2.rectangle(overlay, (x_enter, 0), (w, h), (0, 255, 0), -1)
+    # blend
+    alpha = 0.15
+    cv2.addWeighted(overlay, alpha, vis, 1 - alpha, 0, vis)
+
+    # draw the vertical boundary lines
+    cv2.line(vis, (x_exit, 0), (x_exit, h), (0, 255, 255), 2)
+    cv2.line(vis, (x_enter, 0), (x_enter, h), (0, 255, 0), 2)
+
+    # labels with pixel coordinates
+    cv2.putText(
+        vis, f"EXIT < x<={x_exit}px", (10, h - 24),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA
+    )
+    cv2.putText(
+        vis, f"ENTER >= {x_enter}px", (10, h - 6),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA
+    )
+
+
+# -------------------- Server interaction -----------------------------------
 def send_plate_event(plate, x, frame_width):
     """
     Function: send_plate_event
-    Purpose: Call the server URL based on plate location (enter/exit).
-    Methods: requests.get with timeout, status code handling.
-    Creates: uri string, response object.
+    Purpose: Call the server URL based on plate location (enter/exit),
+             and interpret recycled status codes according to operation.
+    Methods: Decide op by x; requests.get; branch by op and status code.
+    Creates: 'op' string; 'uri' string; prints human-friendly messages.
     """
     try:
+        # Decide operation by horizontal position
+        print(f"The plate location is {x}")
         if x > frame_width * ENTER_ZONE_X_LIMIT:
+            op = 'enter'
             uri = f"{URL}/enter/{plate}"
         elif x < frame_width * EXIT_ZONE_X_LIMIT:
+            op = 'exit'
             uri = f"{URL}/exit/{plate}"
         else:
-            return  # ignore center
+            return  # ignore center (no-op)
 
         response = requests.get(uri, timeout=5)
-        print(f"Sent {uri} -> Status: {response.status_code}")
-        if response.status_code == 110:
-            print("Car entered successfully.")
-        elif response.status_code == 111:
-            print("Car already in carpark.")
-        elif response.status_code == 120:
-            print("Exit: fees paid.")
-        elif response.status_code == 121:
-            print("Exit: fees NOT paid.")
-        elif response.status_code == 122:
-            print("Exit: error occurred.")
+        code = response.status_code
+        print(f"Sent {uri} -> HTTP {code}")
+
+        # Interpret recycled codes per operation
+        if op == 'enter':
+            # (210: added | 211: already exists | 213: error or invalid)
+            if code == 210:
+                print("Enter: plate added, open gate.")
+                # servo.set_gate(0, False)  # optionally open entry
+            elif code == 211:
+                print("Enter: already exists, do not open gate.")
+            elif code == 213:
+                print("Enter: invalid plate format or server error.")
+            else:
+                print(f"Enter: unexpected status {code}")
+
+        else:  # op == 'exit'
+            # (210: paid, exit allowed | 211: not paid | 212: not found | 213: error)
+            if code == 210:
+                print("Exit: paid up, exit permitted, open gate.")
+                # servo.set_gate(1, False)  # optionally open exit
+            elif code == 211:
+                print("Exit: NOT paid, keep gate closed.")
+            elif code == 212:
+                print("Exit: plate not found.")
+            elif code == 213:
+                print("Exit: server error or invalid plate.")
+            else:
+                print(f"Exit: unexpected status {code}")
+
     except requests.exceptions.RequestException as e:
         print(f"Request failed: {e}")
 
-# -------- Anti-spam helpers -------------------------------------------------
-def start_block(plate):
-    """
-    Function: start_block
-    Purpose: Begin a 10 s block window after sending 'plate'.
-    Methods: Fill global vars with current monotonic time.
-    Creates: block_active, block_deadline, last_* globals.
-    """
-    global block_active, block_deadline
-    global last_sent_plate, last_seen_plate, last_seen_x
-    global last_seen_time, last_seen_equal
-
-    now = time.monotonic()
-    last_sent_plate = plate
-    block_active = True
-    block_deadline = now + SIMILAR_TIMEOUT
-
-    last_seen_plate = plate
-    last_seen_x = 0
-    last_seen_time = now
-    last_seen_equal = True
-
-
+# --------------------- Anti-spam helpers -----------------------------------
 def handle_candidate(candidate, x, frame_width):
     """
     Function: handle_candidate
-    Purpose: Decide sending vs waiting for a 'candidate' plate.
-    Methods: if/else using global block state; start_block().
-    Creates: updates last_seen_*; calls send_plate_event when allowed.
+    Purpose: Simple anti-spam: do not resend the same plate within
+    BLOCK_TIMEOUT seconds; otherwise send immediately.
+    Methods: Compare candidate vs last_sent_plate and time delta;
+    call send_plate_event(); update globals.
+    Creates: updates last_sent_*.
     """
-    global block_active, last_seen_plate, last_seen_x
-    global last_seen_time, last_seen_equal, last_sent_plate
-
+    global last_sent_plate, last_sent_time
     now = time.monotonic()
 
-    # Update what we currently see
-    last_seen_plate = candidate
-    last_seen_x = x
-    last_seen_time = now
-    last_seen_equal = (candidate == last_sent_plate)
-
-    # If no block -> send immediately and start block
-    if (not block_active) or (not last_sent_plate):
-        send_plate_event(candidate, x, frame_width)
-        start_block(candidate)
+    if candidate == last_sent_plate and (now - last_sent_time) < BLOCK_TIMEOUT:
         return
 
-    # In block: exact same plate -> wait (do not resend)
-    if last_seen_equal:
-        return
-
-    # In block: similar/partial but different -> hold till timeout
-    if is_partial_or_similar(candidate, last_sent_plate):
-        return
-
-    # In block: different enough -> send immediately and start new block
+    print(f"The plate location is {x}")
     send_plate_event(candidate, x, frame_width)
-    start_block(candidate)
+    last_sent_plate = candidate
+    last_sent_time = now
 
-
-def check_timeout(frame_width):
+# -------------------- Multi-OCR aggregation --------------------------------
+def clear_aggr(bucket):
     """
-    Function: check_timeout
-    Purpose: At/after deadline decide what to do and end the block.
-    Methods: If still exact same -> print "please move on!";
-             Else if similar but different -> send last_seen now.
-    Creates: may call send_plate_event/start_block; may clear block.
+    Function: clear_aggr
+    Purpose: Reset aggregation bucket to empty state.
+    Methods: Clear list and zero start_ts; reset streak fields.
+    Creates: empties 'samples', sets 'start_ts' to 0; clears streak.
     """
-    global block_active, block_deadline, last_seen_time
-    global last_seen_plate, last_seen_x, last_seen_equal
-    global last_sent_plate
+    bucket['samples'].clear()
+    bucket['start_ts'] = 0.0
+    bucket['streak_plate'] = ''
+    bucket['streak_count'] = 0
+    bucket['streak_x'] = 0
+    bucket['valid_seen_set'].clear()
 
-    if not block_active:
-        return
+# -------------------- Scan mode handling -----------------------------------
+def toggle_mode(new_mode):
+    """
+    Function: toggle_mode
+    Purpose: Toggle scanning mode between 'idle', 'enter', and 'exit'.
+    Methods: Switch logic; clearing aggregators on mode change.
+    Creates: updates global scan_mode; resets aggr buckets.
+    """
+    global scan_mode
+    global aggr_left, aggr_right
+    if scan_mode == new_mode:
+        scan_mode = 'idle'
+    else:
+        scan_mode = new_mode
+    clear_aggr(aggr_left)
+    clear_aggr(aggr_right)
+    print(f"Scan mode: {scan_mode.upper() if scan_mode!='idle' else 'IDLE'}")
 
-    now = time.monotonic()
-    if now < block_deadline:
-        return
-
-    # End the block window by decision:
-    block_active = False
-
-    # If we still see the exact same plate -> ask driver to move
-    if last_seen_equal and ((now - last_seen_time) <= READ_PERIOD):
-        if last_sent_plate:
-            print(f"{last_sent_plate}, please move on!")
-        return
-
-    # If we see similar/partial but different -> send it now
-    if last_seen_plate and \
-       is_partial_or_similar(last_seen_plate, last_sent_plate) and \
-       (last_seen_plate != last_sent_plate):
-        send_plate_event(last_seen_plate, last_seen_x, frame_width)
-        start_block(last_seen_plate)
-        return
-
-    # Otherwise nothing to do (block simply ends)
-    # Next candidate will start a new block on send.
-
-
-# ---- Main Loop -------------------------------------------------------------
-
+# ----------------------------- Main Loop -----------------------------------
 def main():
     """
     Function: main
     Purpose: Open camera, run detection loop with 2 Hz OCR and
-             simplified anti-spam, draw boxes/labels, handle keys.
-    Methods: cv2.VideoCapture, find_plate_candidates, preprocess_roi,
-             ocr_plate, normalize_plate, simple if/else state.
+             anti-spam; react to GPIO14/GPIO4 and multi-OCR filter.
+    Methods: cv2.VideoCapture, find_plate_candidates, ocr_bbox,
+             aggregation, anti-spam state machine; Sense HAT display.
     Creates: cap, next_read_ts, labels, vis, key variables.
     """
-    global next_read_ts
+    global next_read_ts, scan_mode, show_zones
+
+    # Init Sense HAT and GPIO
+    sense = SenseHat()
+    sense.clear()
+
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(PIN_ENTER, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(PIN_EXIT,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_RESOLUTION[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_RESOLUTION[1])
     if not cap.isOpened():
         print("ERROR: Cannot open USB camera!")
+        GPIO.cleanup()
+        sense.clear()
         return
-    print("Press 'q' to quit, 's' to save snapshot.")
+
+    print("Press 'e' ENTER-only, 'x' EXIT-only, 's' snapshot, 'z' toggle zones, 'q' quit.")
+    print("GPIO4=Exit(blue v), GPIO14=Enter(red ^); both -> EXIT prioritized.")
+
     next_read_ts = 0.0
+    prev_state = (None, None)
+
+    # Camera picture settings
+    brightness = 58
+    contrast = 148
+    gain = 128
+
+    # OCR area settings
+    global area_min, area_max
 
     try:
         while True:
@@ -396,72 +789,114 @@ def main():
                 time.sleep(0.02)
                 continue
 
-            boxes = find_plate_candidates(frame)
-            best_left, best_right = pick_best_by_side(boxes, frame.shape[1])
-            labels = []
+            # Read GPIO and show arrows; set mode with EXIT priority
+            enter_low, exit_low = read_gpio_state()
+            show_arrows(sense, enter_low, exit_low)
+            if exit_low:
+                force_mode('exit')
+            elif enter_low:
+                force_mode('enter')
+            else:
+                force_mode('idle')
 
-            # Make sure OCR is done only twice per second (every 0.5 seconds)
+            boxes = find_plate_candidates(frame)
+            best_left, best_right = pick_best_by_side(
+                boxes, frame.shape[1]
+            )
+
+            # Throttled OCR sampling in active modes only
             now = time.monotonic()
             if now >= next_read_ts:
                 next_read_ts = now + READ_PERIOD
 
-                chosen_plate = ""
-                chosen_x = 0
+                if scan_mode == 'exit' and best_left:
+                    p, conf, px = ocr_bbox(frame, best_left)
+                    if p:
+                        update_streak(aggr_left, p, px)
+                        add_sample(aggr_left, p, conf, px)
+                    maybe_finalize(aggr_left, frame.shape[1])
 
-                for idx, (x,y,w,h) in enumerate(boxes,1):
-                    roi = frame[y:y + h, x:x + w]
-                    roi = cv2.resize(roi, None, fx=2.0, fy=2.0,
-                                    interpolation=cv2.INTER_CUBIC)
-                    th = preprocess_roi(roi)
-                    raw = ocr_plate(th)
-                    plate = normalize_plate(raw)
+                if scan_mode == 'enter' and best_right:
+                    p, conf, px = ocr_bbox(frame, best_right)
+                    if p:
+                        update_streak(aggr_right, p, px)
+                        add_sample(aggr_right, p, conf, px)
+                    maybe_finalize(aggr_right, frame.shape[1])
 
-                    if PRINT_ALL_OCR:
-                        print(f"[cand {idx}] raw={raw!r} norm={plate!r}")
-
-                    if 5 <= len(plate) <= 8:
-                        if not chosen_plate:
-                            chosen_plate = plate
-                            chosen_x = x
-                        labels.append(plate)
-                    else:
-                        labels.append("")
-                if  chosen_plate:
-                    handle_candidate(chosen_plate, chosen_x, frame.shape[1])
-
-                # Check if timeout reached
-                check_timeout(frame.shape[1])
-
-            # Draw boxes/Labels every frame
+            # Draw boxes/labels every frame
             vis = frame.copy()
-            for (x,y,w,h), lab in zip(boxes, labels) or [""] * len(boxes):
-                cv2.rectangle(vis, (x,y), (x+w, y+h), (0,255,0),2)
-                if lab:
-                    cv2.putText(vis, lab, (x,y - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX,0.6,
-                                (0,255,0), 2, cv2.LINE_AA)
-                    
+            if show_zones:
+                draw_zones(vis)
+            for (x, y, w, h) in boxes:
+                cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            # HUD: show current scan mode
+            hud = "MODE: "
+            if scan_mode == 'idle':
+                hud += "IDLE"
+                color = (200, 200, 200)
+            elif scan_mode == 'enter':
+                hud += "ENTER (Right)"
+                color = (0, 255, 0)
+            else:
+                hud += "EXIT (Left)"
+                color = (0, 255, 255)
+            cv2.putText(
+                vis, hud, (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA
+            )
+
             cv2.imshow("Gate Watcher", vis)
 
-            # Check for user input:
+            # Check for user input (window has the focus)
             key = cv2.waitKey(1) & 0xFF
-            # This is tested in the frame window, not in the terminal
-
             if key == ord('q'):
                 print("Exiting")
                 break
-
             elif key == ord('s'):
                 name = datetime.now().strftime("gate_%Y%m%d_%H%M%S.jpg")
                 cv2.imwrite(name, vis)
                 print(f"Frame saved into {name}")
-            
-    except KeyboardInterrupt:
-        print("\nInterrupted byt Ctrl+C. Exiting...")
+            elif key == ord('e'):  # ENTER side only
+                toggle_mode('enter')
+            elif key == ord('x'):  # EXIT side only
+                toggle_mode('exit')
+            elif key == ord('z'):    # Toggle enter/exit zones
+                show_zones = not show_zones
+                print(f"Zone overlay: {'ON' if show_zones else 'OFF'}")
+            elif key == ord(','):
+                brightness -= 5
+                brightness = set_brightness(brightness)
 
+            elif key == ord('.'):
+                brightness += 5
+                brightness = set_brightness(brightness)
+
+            elif key == ord(';'):
+                contrast -= 5
+                contrast = set_contrast(contrast)
+
+            elif key == ord("'"):
+                contrast += 5
+                contrast = set_contrast(contrast)
+            
+            elif key == ord('['):
+                area_min = max(AREA_ABS_MIN, area_min - AREA_STEP)
+                area_max = max(area_min + 2.5*AREA_ABS_MIN, area_max - AREA_STEP)
+                print(f"Area range: {area_min}–{area_max}")
+
+            elif key == ord(']'):
+                area_min = min(60000, area_min + AREA_STEP)
+                area_max = min(100000, area_max + AREA_STEP)
+                print(f"Area range: {area_min}–{area_max}")
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by Ctrl+C. Exiting...")
     finally:
         cap.release()
         cv2.destroyAllWindows()
+        sense.clear()
+        GPIO.cleanup()
 
 if __name__ == "__main__":
     main()
