@@ -11,8 +11,11 @@ sudo systemctl start pigpiod
 import RPi.GPIO as GPIO
 from time import sleep
 
-ENTRY_PIN = 16  # physical pin 16
-EXIT_PIN = 18
+ENTRY_PIN = 23  # physical pin 16
+EXIT_PIN = 24 # physical pin 
+
+GPIO.setup(ENTRY_PIN, GPIO.OUT)
+GPIO.setup(EXIT_PIN, GPIO.OUT)
 
 def set_gate(gate_id: int, close: bool):
     FREQ = 50  # 50 Hz for servo
@@ -41,9 +44,8 @@ def set_gate(gate_id: int, close: bool):
     # Convert angle to duty cycle (approximate for SG90)
     duty = 2.5 + (angle / 18.0)  # maps 0–180° to ~2.5–12.5% duty
 
-    GPIO.setmode(GPIO.BOARD)
+    # GPIO.setmode(GPIO.BOARD)
     GPIO.setwarnings(False)
-    GPIO.setup(PIN, GPIO.OUT)
 
     pwm = GPIO.PWM(PIN, FREQ)
     pwm.start(0)
@@ -53,7 +55,7 @@ def set_gate(gate_id: int, close: bool):
         sleep(0.7)  # wait for the servo to reach position
     finally:
         pwm.stop()
-        GPIO.cleanup()
+        # GPIO.cleanup()
 
     print(f"Moved servo to {angle}° (duty cycle {duty:.2f}%)")
 
