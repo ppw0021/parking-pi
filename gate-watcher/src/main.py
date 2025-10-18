@@ -69,6 +69,7 @@ import time
 from datetime import datetime
 import re
 import RPi.GPIO as GPIO
+from leds import LedControl
 
 # Needed for Servo, LEDs, and Buttons
 GPIO.setmode(GPIO.BCM)
@@ -90,7 +91,17 @@ EXIT_LED_PINS = [9, 0, 11]
 ENTRY_BUTTON_PIN = 19
 EXIT_BUTTON_PIN = 10
 SERVO_ENTRY_PIN = 23  # physical pin 16
-SERVO_EXIT_PIN = 24 # physical pin 
+SERVO_EXIT_PIN = 24 # physical pin
+
+# --- LED controller instance (uses the configured pins) ---
+led = LedControl(ENTRY_LED_PINS, EXIT_LED_PINS)
+
+# Use `led` methods:
+#   led.blue_on('enter'/'exit')
+#   led.blue_off('enter'/'exit')
+#   led.green_on(...), led.green_off(...)
+#   led.red_on(...),   led.red_off(...)
+#   led.blink_red(side, times=3, freq_hz=1.0)
 
 # Setup button pins
 GPIO.setup(ENTRY_BUTTON_PIN, GPIO.IN)
@@ -105,68 +116,6 @@ for pin in EXIT_LED_PINS:
 # Setup servo
 GPIO.setup(SERVO_ENTRY_PIN, GPIO.OUT)
 GPIO.setup(SERVO_EXIT_PIN, GPIO.OUT)
-
-# Set gate, 0 is entrance, 1 is exit, True is closed, False is open
-def set_gate(gate_id: int, close: bool):
-    FREQ = 50  # 50 Hz for servo
-    PIN = 0
-    if gate_id == 0:
-        PIN = SERVO_ENTRY_PIN
-    elif gate_id == 1:
-        PIN = SERVO_EXIT_PIN
-    else:
-        return
-
-    if close:
-        # Close
-        angle = 0
-
-    else:
-        # Open
-        if gate_id == 0:
-            angle = 70
-        else:
-            angle = 90
-
-    # Safety clamp
-    angle = max(0, min(180, angle))
-
-    # Convert angle to duty cycle (approximate for SG90)
-    duty = 2.5 + (angle / 18.0)  # maps 0–180° to ~2.5–12.5% duty
-
-    # GPIO.setmode(GPIO.BOARD)
-    GPIO.setwarnings(False)
-
-    pwm = GPIO.PWM(PIN, FREQ)
-    pwm.start(0)
-
-    try:
-        pwm.ChangeDutyCycle(duty)
-        sleep(0.7)  # wait for the servo to reach position
-    finally:
-        pwm.stop()
-        # GPIO.cleanup()
-
-    print(f"Moved servo to {angle}° (duty cycle {duty:.2f}%)")
-
-# --- NEW: GPIO + Sense HAT --------------------------------------------------
-# Open Gates
-# set_gate(0, False) # Open gate 0 (Entry gate)
-# set_gate(1, False) # Open gate 1 (Exit gate)
-# sleep(1)
-#
-# Close Gates
-# set_gate(0, True)  # Close gate 0 (Entry gate)
-# set_gate(1, True)  # Close gate 1 (Exit gate)
-#
-# Set LED 0=red, 1=blue, 2=green, GPIO.HIGH is on, GPIO.LOW is off
-# GPIO.output(ENTRY_LED_PINS[0], GPIO.HIGH)
-#
-# Check button for entry
-# if GPIO.input(ENTRY_BUTTON_PIN) == GPIO.HIGH:
-#
-# Check button for exit
-# if GPIO.input(EXIT_BUTTON_PIN) == GPIO.HIGH:
 
 
 # ---- Configuration ---------------------------------------------------------
@@ -185,6 +134,9 @@ PRINT_ALL_OCR = True #
 # OCR constants:
 EXIT_ZONE_X_LIMIT = 0.52  # Left side -> Exit
 ENTER_ZONE_X_LIMIT = 0.58 # Right side -> Entrance
+# Flag to flip bay sides: when True, EXIT bay is on the right side
+EXIT_ON_RIGHT = True
+
 RE_PLATE = re.compile(r'^[A-Z]{3}\d{3}$')
 REQUIRE_ONE_VALID_SAMPLE_FOR_STREAK = False
 
@@ -197,8 +149,8 @@ MIN_FINAL_LEN   = (6, 6) # Allowed length range for acceptable string
 MIN_FINAL_SAMPLES = 2    # Need >=2 valid readings
 
 # Image processing
-AREA_MIN  = 4000
-AREA_MAX  = 7000
+AREA_MIN  = 10000
+AREA_MAX  = 14000
 AREA_STEP = 1000
 AREA_ABS_MIN = 200
 area_min  = AREA_MIN
@@ -242,47 +194,6 @@ aggr_right = {'samples': [], 'start_ts': 0.0,
 
 show_zones = True  # press 'z' to toggle at runtime
 
-# --- GPIO pins and LED arrow patterns ---------------------------------------
-PIN_ENTER = 14   # BCM 14 -> Enter (Up arrow)
-PIN_EXIT  = 4    # BCM 4  -> Exit  (Down arrow)
-DEBOUNCE_SEC = 0.05
-
-RED  = (255, 0,   0)
-BLUE = (0,   0, 255)
-BLK  = (0,   0,   0)
-
-UP_RED = [
-    "00000000",
-    "00r00000",
-    "0rrr0000",
-    "00r00000",
-    "00r00000",
-    "00r00000",
-    "00r00000",
-    "00000000",
-]
-
-DOWN_BLUE = [
-    "00000000",
-    "00000b00",
-    "00000b00",
-    "00000b00",
-    "00000b00",
-    "0000bbb0",
-    "00000b00",
-    "00000000",
-]
-
-BOTH = [
-    "00000000",
-    "00r00b00",
-    "0rrr0b00",
-    "00r00b00",
-    "00r00b00",
-    "00r0bbb0",
-    "00r00b00",
-    "00000000",
-]
 
 # ---- Functions -------------------------------------------------------------
 # -------- GPIO handling -----------------------------------------------------
@@ -304,21 +215,28 @@ def pattern_to_pixels(pat):
                 pix.append(BLK)
     return pix
 
-def show_arrows(sense, enter_low, exit_low):
+
+def side_by_x(x, frame_width):
     """
-    Function: show_arrows
-    Purpose: Display arrows on Sense HAT based on GPIO state.
-    Methods: Choose UP/DOWN/BOTH; call sense.set_pixels(); clear if none.
-    Creates: local 'pixels' list when any input is active.
+    Function: side_by_x
+    Purpose: Decide 'enter' or 'exit' by x-position and EXIT_ON_RIGHT.
+    Methods: Compare with ENTER/EXIT zone limits; branch by flag.
+    Creates: returns 'enter' or 'exit'; 'middle' is handled elsewhere.
     """
-    if enter_low and exit_low:
-        sense.set_pixels(pattern_to_pixels(BOTH))
-    elif exit_low:
-        sense.set_pixels(pattern_to_pixels(DOWN_BLUE))
-    elif enter_low:
-        sense.set_pixels(pattern_to_pixels(UP_RED))
+    # left/right classification
+    is_left  = x < frame_width * EXIT_ZONE_X_LIMIT
+    is_right = x > frame_width * ENTER_ZONE_X_LIMIT
+
+    if EXIT_ON_RIGHT:
+        # Right -> 'exit'; Left -> 'enter'
+        if is_right: return 'exit'
+        if is_left:  return 'enter'
     else:
-        sense.clear()
+        # Left -> 'exit'; Right -> 'enter'
+        if is_left:  return 'exit'
+        if is_right: return 'enter'
+    return 'middle'
+
 
 def read_gpio_state():
     """
@@ -330,24 +248,6 @@ def read_gpio_state():
     enter_high = (GPIO.input(ENTRY_BUTTON_PIN) == GPIO.HIGH)
     exit_high  = (GPIO.input(EXIT_BUTTON_PIN)  == GPIO.HIGH)
     return enter_high, exit_high
-
-def led_set(led_side, led_color, delay):
-    '''
-        Function: led_set
-        Purpose: Turn LEDs on/off
-        Methods: GPIO.output
-        Creates: Nothing
-    '''
-    if led_side == 'enter':
-        GPIO.output(ENTRY_LED_PINS[led_color], GPIO.HIGH)
-        if delay:
-            time.sleep(delay)
-            return
-    if led_side == 'exit':
-        GPIO.output(ENTRY_LED_PINS[led_color], GPIO.HIGH)
-        if delay:
-            time.sleep(delay)
-            return
 
 
 # def force_mode(new_mode):
@@ -364,6 +264,50 @@ def led_set(led_side, led_color, delay):
 #         clear_aggr(aggr_right)
 #         print(f"Scan mode: "
 #               f"{scan_mode.upper() if scan_mode!='idle' else 'IDLE'}")
+
+
+# Set gate, 0 is entrance, 1 is exit, True is closed, False is open
+def set_gate(gate_id: int, close: bool):
+    FREQ = 50  # 50 Hz for servo
+    PIN = 0
+    if gate_id == 0:
+        PIN = SERVO_ENTRY_PIN
+    elif gate_id == 1:
+        PIN = SERVO_EXIT_PIN
+    else:
+        return
+
+    if close:
+        # Close
+        angle = 0
+
+    else:
+        # Open
+        if gate_id == 0:
+            angle = 70
+        else:
+            angle = 90
+
+    # Safety clamp
+    angle = max(0, min(180, angle))
+
+    # Convert angle to duty cycle (approximate for SG90)
+    duty = 2.5 + (angle / 18.0)  # maps 0–180° to ~2.5–12.5% duty
+
+    # GPIO.setmode(GPIO.BOARD)
+    GPIO.setwarnings(False)
+
+    pwm = GPIO.PWM(PIN, FREQ)
+    pwm.start(0)
+
+    try:
+        pwm.ChangeDutyCycle(duty)
+        sleep(0.7)  # wait for the servo to reach position
+    finally:
+        pwm.stop()
+        # GPIO.cleanup()
+
+    print(f"Moved servo to {angle}° (duty cycle {duty:.2f}%)")
 
 
 # ---------------- Image preprocessing and OCR -------------------------------
@@ -802,71 +746,56 @@ def draw_box_with_area(vis, box, color=(0, 255, 0)):
 def send_plate_event(plate, x, frame_width):
     """
     Function: send_plate_event
-    Purpose: Call the server URL based on plate location (enter/exit),
-             and interpret recycled status codes according to operation.
-    Methods: Decide op by x; requests.get; branch by op and status code.
-    Creates: 'op' string; 'uri' string; prints human-friendly messages.
+    Purpose: Choose operation by x using EXIT_ON_RIGHT; drive LEDs:
+             success -> GREEN on, then off after gate cycle;
+             negative -> RED on; error -> blink RED 3x at 1 Hz.
+    Methods: side_by_x(...); requests.get(...); set_gate(...); led.*.
+    Creates: 'op' and 'uri'; prints status for diagnostics.
     """
     try:
-        # Decide operation by horizontal position
-        print(f"The plate location is {x}")
-        if x > frame_width * ENTER_ZONE_X_LIMIT:
-            op = 'enter'
-            uri = f"{URL}/enter/{plate}"
-        elif x < frame_width * EXIT_ZONE_X_LIMIT:
-            op = 'exit'
-            uri = f"{URL}/exit/{plate}"
-        else:
-            return  # ignore center (no-op)
+        side = side_by_x(x, frame_width)  # 'enter'/'exit'/'middle'
+        if side == 'middle':
+            return
+
+        # Build operation from side
+        op = side
+        uri = f"{URL}/{op}/{plate}"
 
         response = requests.get(uri, timeout=5)
         code = response.status_code
         print(f"Sent {uri} -> HTTP {code}")
 
-        # Interpret recycled codes per operation
-        if op == 'enter':
-            # (210: added | 211: already exists | 213: error or invalid)
-            if code == 210:
-                print("Enter: plate added, open gate.")
-                led_set(op,0,0.01) # Blue LED off
-                led_set(op,1,1)    # Green LED on
-                set_gate(0, False) # Open gate
-                time.sleep(3)      # Wait for 3 seconds
-                set_gate(0, True)  # Close gate
-                led_set(op,1,0.01) # Green LED off
-                
-            elif code == 211:
-                print("Enter: already exists, do not open gate.")
-                led_set(op,2,2)    # Red LED on for 2 second
-            elif code == 213:
-                print("Enter: invalid plate format or server error.")
-                led_set(op,2,2)    # Red LED on for 2 second
-            else:
-                print(f"Enter: unexpected status {code}")
-                led_set(op,2,2)    # Red LED on for 2 second
+        # Success is HTTP 210 in both directions
+        if code == 210:
+            print(f"{op.title()}: success, open gate.")
+            # GREEN on, open gate, wait, close, GREEN off
+            led.green_on(op)
+            set_gate(0 if op == 'enter' else 1, False)  # open
+            time.sleep(3)
+            set_gate(0 if op == 'enter' else 1, True)   # close
+            led.green_off(op)
 
-        else:  # op == 'exit'
-            # (210: paid, exit allowed | 211: not paid | 212: not found | 213: error)
-            if code == 210:
-                print("Exit: paid up, exit permitted, open gate.")
-                led_set(op,0,0.01) # Blue LED off
-                led_set(op,1,0)    # Green LED on
-                set_gate(0, False) # Open gate
-                time.sleep(3)      # Wait for 3 seconds
-                set_gate(0, True) # Close gate
-                led_set(op,1,0.01)    # Green LED off
-                
-            elif code == 211:
-                print("Exit: NOT paid, keep gate closed.")
-            elif code == 212:
-                print("Exit: plate not found.")
-            elif code == 213:
-                print("Exit: server error or invalid plate.")
-            else:
-                print(f"Exit: unexpected status {code}")
+        # Negative results (e.g., 211 not allowed, 212 not found)
+        elif code in (211, 212):
+            print(f"{op.title()}: negative reply ({code}).")
+            led.red_on(op)
+
+        # Error / invalid
+        elif code == 213:
+            print(f"{op.title()}: error/invalid plate.")
+            led.blink_red(op, times=3, freq_hz=1.0)
+
+        # Any unexpected status -> treat as error
+        else:
+            print(f"{op.title()}: unexpected status {code}.")
+            led.blink_red(op, times=3, freq_hz=1.0)
 
     except requests.exceptions.RequestException as e:
         print(f"Request failed: {e}")
+        # Transport-level error -> blink RED for whichever side it was
+        side = side_by_x(x, frame_width)
+        if side in ('enter', 'exit'):
+            led.blink_red(side, times=3, freq_hz=1.0)
 
 # --------------------- Anti-spam helpers -----------------------------------
 def handle_candidate(candidate, x, frame_width):
@@ -874,6 +803,8 @@ def handle_candidate(candidate, x, frame_width):
     Function: handle_candidate
     Purpose: Simple anti-spam: do not resend the same plate within
     BLOCK_TIMEOUT seconds; otherwise send immediately.
+    BEFORE sending:
+             turn BLUE LED OFF for the detected side.
     Methods: Compare candidate vs last_sent_plate and time delta;
     call send_plate_event(); update globals.
     Creates: updates last_sent_*.
@@ -883,6 +814,11 @@ def handle_candidate(candidate, x, frame_width):
 
     if candidate == last_sent_plate and (now - last_sent_time) < BLOCK_TIMEOUT:
         return
+
+    # Turn blue OFF before contacting the server
+    side = side_by_x(x, frame_width)
+    if side in ('enter', 'exit'):
+        led.blue_off(side)
 
     print(f"The plate location is {x}")
     send_plate_event(candidate, x, frame_width)
@@ -920,6 +856,14 @@ def toggle_mode(new_mode):
         scan_mode = new_mode
     clear_aggr(aggr_left)
     clear_aggr(aggr_right)
+
+    # LED policy (no flicker):
+    led.all_off()
+    if scan_mode == 'enter':
+        led.blue_on('enter')
+    elif scan_mode == 'exit':
+        led.blue_on('exit')
+
     print(f"Scan mode: {scan_mode.upper() if scan_mode!='idle' else 'IDLE'}")
     time.sleep(0.5)
 
@@ -930,18 +874,15 @@ def main():
     Purpose: Open camera, run detection loop with 2 Hz OCR and
              anti-spam; react to GPIO14/GPIO4 and multi-OCR filter.
     Methods: cv2.VideoCapture, find_plate_candidates, ocr_bbox,
-             aggregation, anti-spam state machine; Sense HAT display.
+             aggregation, anti-spam state machine.
     Creates: cap, next_read_ts, labels, vis, key variables.
     """
     global next_read_ts, scan_mode, show_zones
 
-    # Init Sense HAT and GPIO
-    # sense = SenseHat()
-    # sense.clear()
 
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(PIN_ENTER, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(PIN_EXIT,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    # GPIO.setmode(GPIO.BCM)
+    # GPIO.setup(ENTRY_BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    # GPIO.setup(EXIT_BUTTON_PIN,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_RESOLUTION[0])
@@ -949,7 +890,6 @@ def main():
     if not cap.isOpened():
         print("ERROR: Cannot open USB camera!")
         GPIO.cleanup()
-        # sense.clear()
         return
 
     print("Press 'e' ENTER-only, 'x' EXIT-only, 's' snapshot, 'z' toggle zones, 'q' quit.")
@@ -959,9 +899,8 @@ def main():
     prev_state = (None, None)
 
     # Camera picture settings
-    brightness = 125
+    brightness = 115
     contrast = 170
-    gain = 128
 
     # OCR area settings
     global area_min, area_max
@@ -973,9 +912,8 @@ def main():
                 time.sleep(0.02)
                 continue
 
-            # Read GPIO and show arrows; set mode with EXIT priority
+            # Read GPIO; set mode with EXIT priority
             enter_high, exit_high = read_gpio_state()
-            # show_arrows(sense, enter_high, exit_high)
             if exit_high:
                 toggle_mode('exit')
             elif enter_high:
@@ -995,7 +933,6 @@ def main():
                 next_read_ts = now + READ_PERIOD
 
                 if scan_mode == 'exit' and best_left:
-                    led_set('exit',2,0)
                     p, conf, px = ocr_bbox(frame, best_left)
                     if p:
                         update_streak(aggr_left, p, px)
@@ -1003,7 +940,6 @@ def main():
                     maybe_finalize(aggr_left, frame.shape[1])
 
                 if scan_mode == 'enter' and best_right:
-                    led_set('enter',2,0)
                     p, conf, px = ocr_bbox(frame, best_right)
                     if p:
                         update_streak(aggr_right, p, px)
@@ -1024,10 +960,10 @@ def main():
                 hud += "IDLE"
                 color = (200, 200, 200)
             elif scan_mode == 'enter':
-                hud += "ENTER (Right)"
+                hud += "ENTER (Right)" if EXIT_ON_RIGHT is False else "ENTER (Left)"
                 color = (0, 255, 0)
-            else:
-                hud += "EXIT (Left)"
+            else:  # 'exit'
+                hud += "EXIT (Left)" if EXIT_ON_RIGHT is False else "EXIT (Right)"
                 color = (0, 255, 255)
             cv2.putText(
                 vis, hud, (10, 24),
@@ -1083,7 +1019,6 @@ def main():
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        # sense.clear()
         GPIO.cleanup()
 
 if __name__ == "__main__":
