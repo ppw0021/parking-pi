@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Parking Service - Admin Panel</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+    <header>
+        <h1>Parking Service - Admin Panel</h1>
+    </header>
+
+    <main>
+        <!-- LEFT PANEL -->
+        <section class="left-panel">
+            <h2>Settings</h2>
+            <div class="settings-box">
+                <div class="rate-settings">
+                    <h3>Parking Rate</h3>
+                    <div class="rate-container">
+                        <div class="current-rate">
+                            <label>Current Hourly Rate:</label>
+                            <span id="currentRate">$2.50</span>
+                        </div>
+                        <div class="new-rate">
+                            <label for="newRateInput">New Hourly Rate ($):</label>
+                            <input type="number" id="newRateInput" step="0.50" min="0.50" value="1000">
+                            <button id="updateRateBtn">Update</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <h2>Current Vehicles</h2>
+            <div id="vehicleList" class="info-box">
+                <table id="vehicleTable">
+                    <thead>
+                        <tr>
+                            <th>Plate</th>
+                            <th>Time In</th>
+                            <th>Paid Until</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <!-- Will be populated by JavaScript -->
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- RIGHT PANEL -->
+        <section class="right-panel">
+            <h2>Parking Spots</h2>
+            <table id="parkingTable">
+                <tbody>
+                    <!-- Row 1 -->
+                    <tr>
+                        <td class="ref-column">Entry</td>
+                        <td class="spot available" data-id="0">1</td>
+                        <td class="spot available" data-id="1">2</td>
+                        <td class="spot available" data-id="2">3</td>
+                        <td class="spot available" data-id="3">4</td>
+                        <td class="spot available" data-id="4">5</td>
+                        <td class="spot available" data-id="5">6</td>
+                    </tr>
+
+                    <!-- Row 2 -->
+                    <tr>
+                        <td class="ref-column">--</td>
+                        <td class="road"></td>
+                        <td class="spot available" data-id="6">7</td>
+                        <td class="spot available" data-id="7">8</td>
+                        <td class="spot available" data-id="8">9</td>
+                        <td class="spot available" data-id="9">10</td>
+                        <td class="road"></td>
+                    </tr>
+
+                    <!-- Row 3 -->
+                    <tr>
+                        <td class="ref-column">Exit</td>
+                        <td class="spot available" data-id="10">11</td>
+                        <td class="spot available" data-id="11">12</td>
+                        <td class="spot available" data-id="12">13</td>
+                        <td class="spot available" data-id="13">14</td>
+                        <td class="spot available" data-id="14">15</td>
+                        <td class="spot available" data-id="15">16</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='admin_script.js') }}"></script>
+</body>
+
+</html>

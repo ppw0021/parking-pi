@@ -9,6 +9,8 @@ const successMessage = document.getElementById("successMessage");
 const newPaymentBtn = document.getElementById("newPaymentBtn");
 const paymentForm = document.getElementById("paymentForm");
 
+let parkingRate = 999;
+
 // --- Helper function to show messages ---
 function showMessage(message, type = "info") {
     messageBox.classList.remove("hidden");
@@ -19,6 +21,10 @@ function showMessage(message, type = "info") {
 function hideMessage() {
     messageBox.classList.add("hidden");
 }
+
+function hideInfoBox() {
+    infoBox.classList.add("hidden");
+}
 // --- Check button ---
 checkBtn.addEventListener("click", async () => {
     const plate = plateInput.value.trim();
@@ -26,6 +32,7 @@ checkBtn.addEventListener("click", async () => {
     // If input is empty
     if (!plate) {
         showMessage("Please enter a number plate.", "error");
+        hideInfoBox();
         return;
     }
 
@@ -53,7 +60,8 @@ checkBtn.addEventListener("click", async () => {
                 const hours = Math.round(totalSeconds / 3600);
                 const minutes = Math.ceil((totalSeconds % 3600) / 60);
                 timeParked.textContent = `${hours} hour${hours !== 1 ? 's' : ''} ${minutes} min${minutes !== 1 ? 's' : ''}`;
-                totalDue.textContent = "0.00"; // Replace with real calculation if needed
+                console.log((Math.round(hours * parkingRate) + (minutes/60 * parkingRate)));
+                totalDue.textContent = `${((Math.round(hours * parkingRate) + (minutes/60 * parkingRate)).toFixed(2))}`; // Rounds to 2 decimal places
                 infoBox.style.backgroundColor = "#eef6ff"; // info color
                 infoBox.classList.remove("hidden");
             }
@@ -61,11 +69,13 @@ checkBtn.addEventListener("click", async () => {
         } else {
             // Plate does not exist
             showMessage(`Plate ${plate} not found in database.`, "error");
+            hideInfoBox();
         }
 
     } catch (err) {
         console.error(err);
         showMessage("Error checking plate. See console for details.", "error");
+        hideInfoBox();
     }
 });
 
@@ -96,7 +106,16 @@ function updateParkingSpots() {
 
 // Poll every 5 seconds
 setInterval(updateParkingSpots, 1000);
+setInterval(updateParkingRate, 4000)
 
+function updateParkingRate() {
+    fetch('/hourly-rate')
+        .then(response => response.json())
+        .then(data => {
+            console.log(data.hourlyRate)
+            parkingRate = data.hourlyRate
+        })
+}
 // Initial call on page load
 window.addEventListener('DOMContentLoaded', updateParkingSpots);
 
@@ -144,3 +163,5 @@ newPaymentBtn.addEventListener("click", () => {
     paymentForm.querySelector(".form-group").style.display = "block";
     successMessage.classList.add("hidden");
 });
+
+updateParkingRate()

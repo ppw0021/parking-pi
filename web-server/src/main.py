@@ -34,6 +34,29 @@ initCon.close()
 
 app = Flask(__name__)
 
+# Global variable for hourly rate
+hourly_rate = 1000
+
+# Get hourly rate
+@app.route("/hourly-rate")
+def get_hourly_rate():
+    return jsonify({"hourlyRate": hourly_rate}), 200
+
+# Update hourly rate
+@app.route("/hourly-rate", methods=["POST"])
+def update_hourly_rate():
+    global hourly_rate
+    try:
+        new_rate = request.json.get("hourlyRate")
+        if not new_rate or not isinstance(new_rate, (int, float)) or new_rate <= 0:
+            return jsonify({"error": "Invalid hourly rate"}), 400
+            
+        hourly_rate = float(new_rate)
+        return jsonify({"message": "Hourly rate updated successfully", "hourlyRate": hourly_rate}), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # Customer panel
 @app.route("/")
 def root():
@@ -115,7 +138,39 @@ def pay(plate):
 # Admin panel
 @app.route("/admin")
 def admin():
-    return "Admin Panel"
+    return render_template("admin_index.html")
+
+# Get all vehicles (admin only)
+@app.route("/admin/vehicles")
+def get_vehicles():
+    try:
+        con = sqlite3.connect("parkinglot.db")
+        cur = con.cursor()
+        
+        cur.execute("SELECT plate, timeIn, paidToTime FROM parkingLot")
+        vehicles = cur.fetchall()
+        
+        current_time = int(time.time())
+        vehicle_list = []
+        
+        for plate, time_in, paid_to_time in vehicles:
+            vehicle_list.append({
+                "plate": plate,
+                "timeIn": time_in,
+                "paidToTime": paid_to_time,
+                "isPaid": paid_to_time > current_time
+            })
+            
+        return jsonify(vehicle_list), 200
+        
+    except Exception as e:
+        print(f"Error fetching vehicles: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        con.close()
+
+# Called by gate-watcher
 
 # Called by gate-watcher 
 # Adds plate and time to database
@@ -185,6 +240,9 @@ def exitLot(plate):
         exitPermitted = paidToTime > timeNow
 
         if exitPermitted:
+            # Delete the entry from the database
+            cur.execute("DELETE FROM parkingLot WHERE plate = ?", (plate,))
+            con.commit()
             return jsonify({
                 "message": f"{plate} paid up, exit permitted"
             }), 210
