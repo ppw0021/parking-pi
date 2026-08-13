@@ -1,18 +1,14 @@
 '''
-Required for setup
-sudo apt update
-sudo apt install pigpio python3-pigpio
-
-sudo systemctl enable pigpiod
-sudo systemctl start pigpiod
-
-
+This version is for the Pi 5, which has a different type of package for referencing the GPIO
 '''
 import RPi.GPIO as GPIO
 from time import sleep
 
-ENTRY_PIN = 23  # physical pin 16
-EXIT_PIN = 24 # physical pin 
+ENTRY_PIN = 23  # BCM GPIO 23, physical pin 16
+EXIT_PIN = 24   # BCM GPIO 24, physical pin 18
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
 
 GPIO.setup(ENTRY_PIN, GPIO.OUT)
 GPIO.setup(EXIT_PIN, GPIO.OUT)
