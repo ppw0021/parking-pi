@@ -41,10 +41,12 @@ The web-server / gate-watcher `README.md` files say `uv run main`; the real entr
 `main.py` in every sub-project.
 
 spot-watcher is two scripts, both headless (no GUI — you inspect JPGs written to disk):
-- `uv run cal.py` — interactive prompt to place the 16 bay boxes (`spots.json`) and, with the lot
-  empty, capture reference crops (`refs/00.png`..`15.png`). Writes `cal_preview.jpg` after every
-  change. Rows map to ids: `row0`→0-5, `row1`→6-9, `row2`→10-15. `main.py` exits if `spots.json`
-  or `refs/` is missing.
+- `uv run cal.py` — on first run auto-detects bays from bright vertical lane markers and fits the
+  fixed 6/4/6 layout (`auto_detect`; falls back to an even grid, re-runnable with the `auto`
+  command, debug overlay in `cal_auto_debug.jpg`). Interactive prompt then adjusts the 16 boxes
+  (`spots.json`) and, with the lot empty, `save` captures reference crops (`refs/00.png`..`15.png`).
+  Writes `cal_preview.jpg` after every change. Rows map to ids: `row0`→0-5, `row1`→6-9, `row2`→10-15.
+  `main.py` exits if `spots.json` or `refs/` is missing.
 - `uv run main.py` — every `INTERVAL_SEC`, crop each bay, score it against its reference, POST all
   16 to `/update_spots`. `--dry-run` prints per-bay scores and writes `dryrun_preview.jpg` instead
   of contacting the server — use it to tune `DIFF_THRESHOLD`.
