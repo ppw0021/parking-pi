@@ -22,7 +22,7 @@ import numpy as np
 import requests
 
 # ---------------- Configuration ----------------
-SERVER_URL = "http://10.0.0.2:5000"   # web-server address - set this per site
+SERVER_URL = "http://10.130.1.228:5000"   # web-server address - set this per site
 CAMERA_INDEX = 0
 RESOLUTION = (1920, 1080)
 INTERVAL_SEC = 1.0
