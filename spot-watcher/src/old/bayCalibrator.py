@@ -269,4 +269,4 @@ output = "bays.json"
 app = make_app(img, output)
 print(f"Using image: {img}")
 print(f"Output file: {output}")
-app.run()
+app.run(host="0.0.0.0", port=5000)
