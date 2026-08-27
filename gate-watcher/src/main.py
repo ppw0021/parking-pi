@@ -1,5 +1,5 @@
 '''
-GateWatcher v0.0.12 (20260827_1113):
+GateWatcher v0.0.12 (20260828_1318):
 The code monitors the gates of a parking lot.
 If a license plate is detected on the right part of the creen,
 It means a car is entering, so the code will issue a call to the server:
@@ -108,7 +108,24 @@ GateWatcher v0.0.11 (20251019):
 GateWatcher v0.0.12 (20251019):
  - reply 212 from the server is an error and will be handled as such:
   reply 213/212 errors -> RED blink 3x @1 Hz
-'''
+  
+GateWatcher v0.0.13 (20260828):
+- Manual USB camera calibration added.
+- Disable camera auto exposure, auto white balance and
+  dynamic frame rate control.
+- Fine Tune window now includes camera parameter sliders:
+  brightness, contrast, exposure, gain,
+  white balance, saturation, sharpness and backlight compensation.
+- Camera settings are applied immediately via v4l2-ctl.
+- ROI is cropped before OCR to remove plate borders and
+  surrounding background (CROP_PERCENTAGE).
+- OCR debug windows added:
+  "OCR ROI" and "OCR TH".
+- print_fine_tune_settings() now outputs camera and OCR settings.
+- Detection thresholds updated:
+  AREA_MIN=15000, AREA_MAX=35000,
+  ASPECT_MIN=2.5, ASPECT_MAX=5.0.
+  '''
 import requests
 from time import sleep
 import cv2
@@ -174,11 +191,12 @@ CAMERA_INDEX = 0
 CAMERA_DEVICE = f"/dev/video{CAMERA_INDEX}"
 # WEB_PI_IP = "http://10.138.63.88" # old location
 # WEB_PI_IP = "http://192.168.1.16"    # current location
-WEB_PI_IP =  "http://10.130.1.228"
-# WEB_PI_IP =  "http://10.0.0.2"
+# WEB_PI_IP =  "http://10.130.1.228"
+WEB_PI_IP =  "http://10.0.0.2"
 URL = f"{WEB_PI_IP}:5000"
-ASPECT_MIN = 2.0
-ASPECT_MAX = 6.0
+CROP_PERCENTAGE = 0.10
+ASPECT_MIN = 2.5
+ASPECT_MAX = 5.0
 MAX_CANDIDATES = 10
 PRINT_ALL_OCR = True
 # Zone thresholds (fractions of frame width)
@@ -189,7 +207,7 @@ EXIT_ON_RIGHT = True
 # Strict plate pattern: AAA999
 RE_PLATE = re.compile(r'^[A-Z]{3}\d{3}$')
 # Auto-IDLE settings
-AUTO_IDLE_ENABLED   = True
+AUTO_IDLE_ENABLED   = False
 MAX_TIME_TO_IDLE    = 10.0  # seconds without a spot -> go IDLE
 # OCR confidences and rules
 MIN_SAMPLE_CONF = 40.0
@@ -208,8 +226,8 @@ TESS_CFG_FALLBACK = (
     "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 # Image area settings (bbox area filter controlled by [ / ])
-AREA_MIN     = 7300
-AREA_MAX     = 12000
+AREA_MIN     = 15000
+AREA_MAX     = 35000
 AREA_STEP    = 500
 AREA_ABS_MIN = 500
 AREA_ABS_MAX = 40000
@@ -218,9 +236,19 @@ area_max = AREA_MAX
 CONTRAST = 245
 BRIGHTNESS = 85
 
+# Manual camera controls
+CAMERA_AUTO_EXPOSURE = 1          # Manual mode
+CAMERA_EXPOSURE = 30
+CAMERA_GAIN = 140
+CAMERA_WB_AUTO = 0
+CAMERA_WB_TEMP = 4140
+CAMERA_SATURATION = 128
+CAMERA_SHARPNESS = 128
+CAMERA_BACKLIGHT = 1
+
 # Fine-tune image processing settings
-DARK_THRESHOLD = 128
-LIGHT_THRESHOLD = 240
+DARK_THRESHOLD = 30
+LIGHT_THRESHOLD = 220
 CANNY_LOW = 64
 CANNY_HIGH = 200
 DILATION_ITERATIONS = 2
@@ -405,6 +433,54 @@ def set_gain(value):
     ])
     print(f"Gain: {value}")
     return value
+
+def set_camera_ctrl(name, value):
+    """
+    Function: set_camera_ctrl
+    Purpose: Set any UVC control through v4l2-ctl.
+    Methods: subprocess.call().
+    Creates: none.
+    """
+    subprocess.call([
+        "v4l2-ctl",
+        f"--device={CAMERA_DEVICE}",
+        "--set-ctrl",
+        f"{name}={value}"
+    ])
+    print(f"{name}: {value}")
+
+
+def disable_camera_auto_controls():
+    """
+    Function: disable_camera_auto_controls
+    Purpose: Disable camera auto tuning and apply manual values.
+    """
+
+    set_camera_ctrl("white_balance_automatic", 0)
+    set_camera_ctrl("auto_exposure", 1)
+    set_camera_ctrl("exposure_dynamic_framerate", 0)
+
+    set_camera_ctrl(
+        "white_balance_temperature",
+        CAMERA_WB_TEMP,
+    )
+
+    set_camera_ctrl(
+        "exposure_time_absolute",
+        CAMERA_EXPOSURE,
+    )
+
+    set_camera_ctrl("gain", CAMERA_GAIN)
+    set_camera_ctrl("saturation", CAMERA_SATURATION)
+    set_camera_ctrl("sharpness", CAMERA_SHARPNESS)
+    set_camera_ctrl(
+        "backlight_compensation",
+        CAMERA_BACKLIGHT,
+    )
+
+    set_brightness(BRIGHTNESS)
+    set_contrast(CONTRAST)
+
 def preprocess_roi(roi_bgr):
     """
     Function: preprocess_roi
@@ -814,12 +890,23 @@ def ocr_bbox(frame, box, side_hint=None):
     y2 = min(frame.shape[0], y + h + pad_y)
 
     roi = frame[y1:y2, x1:x2]
+    h, w = roi.shape[:2]
+
+    crop_x = int(w * CROP_PERCENTAGE)
+    crop_y = int(h * CROP_PERCENTAGE*1.5)
+
+    roi = roi[
+        crop_y:h - crop_y,
+        crop_x:w - crop_x
+    ]
     if side_hint == 'exit':
         roi = cv2.rotate(roi, cv2.ROTATE_180)
     roi = cv2.resize(
         roi, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC
     )
     th = preprocess_roi(roi)
+    cv2.imshow("OCR ROI", roi) # DBG
+    cv2.imshow("OCR TH", th)   # DBG
     raw, conf = ocr_text_and_conf(th)
     plate_strict = normalize_plate(raw)
     plate_alias  = alias_key_for_streak(raw)
@@ -1038,6 +1125,10 @@ def fine_tune_trackbar_changed(_value):
     Methods: Read all controls and enforce valid minimum/maximum pairs.
     Creates: Updated global image-processing constants.
     """
+    global BRIGHTNESS
+    global CONTRAST, CAMERA_EXPOSURE, CAMERA_GAIN
+    global CAMERA_WB_TEMP, CAMERA_SATURATION
+    global CAMERA_SHARPNESS, CAMERA_BACKLIGHT
     global DARK_THRESHOLD, LIGHT_THRESHOLD
     global CANNY_LOW, CANNY_HIGH, DILATION_ITERATIONS
     global ASPECT_MIN, ASPECT_MAX, area_min, area_max
@@ -1046,6 +1137,79 @@ def fine_tune_trackbar_changed(_value):
     main_keyboard_active = False
     if fine_tune_trackbar_update:
         return
+
+    BRIGHTNESS = cv2.getTrackbarPos(
+        "Brightness",
+        FINE_TUNE_WINDOW,
+    )
+
+    CONTRAST = cv2.getTrackbarPos(
+        "Contrast",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_EXPOSURE = cv2.getTrackbarPos(
+        "Exposure",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_GAIN = cv2.getTrackbarPos(
+        "Gain",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_WB_TEMP = cv2.getTrackbarPos(
+        "WB Temp",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_SATURATION = cv2.getTrackbarPos(
+        "Saturation",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_SHARPNESS = cv2.getTrackbarPos(
+        "Sharpness",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_BACKLIGHT = cv2.getTrackbarPos(
+        "Backlight",
+        FINE_TUNE_WINDOW,
+    )
+
+    set_brightness(BRIGHTNESS)
+    set_contrast(CONTRAST)
+
+    set_camera_ctrl(
+        "exposure_time_absolute",
+        CAMERA_EXPOSURE,
+    )
+
+    set_camera_ctrl(
+        "white_balance_temperature",
+        CAMERA_WB_TEMP,
+    )
+
+    set_camera_ctrl(
+        "gain",
+        CAMERA_GAIN,
+    )
+
+    set_camera_ctrl(
+        "saturation",
+        CAMERA_SATURATION,
+    )
+
+    set_camera_ctrl(
+        "sharpness",
+        CAMERA_SHARPNESS,
+    )
+
+    set_camera_ctrl(
+       "backlight_compensation",
+        CAMERA_BACKLIGHT,
+    )
 
     DARK_THRESHOLD = cv2.getTrackbarPos("Dark", FINE_TUNE_WINDOW)
     LIGHT_THRESHOLD = cv2.getTrackbarPos("Light", FINE_TUNE_WINDOW)
@@ -1084,6 +1248,14 @@ def sync_fine_tune_trackbars():
 
     fine_tune_trackbar_update = True
     values = (
+        ("Brightness", int(BRIGHTNESS)),
+        ("Contrast", int(CONTRAST)),
+        ("Exposure", int(CAMERA_EXPOSURE)),
+        ("Gain", int(CAMERA_GAIN)),
+        ("WB Temp", int(CAMERA_WB_TEMP)),
+        ("Saturation", int(CAMERA_SATURATION)),
+        ("Sharpness", int(CAMERA_SHARPNESS)),
+        ("Backlight", int(CAMERA_BACKLIGHT)),
         ("Dark", int(DARK_THRESHOLD)),
         ("Light", int(LIGHT_THRESHOLD)),
         ("Area min", int(area_min)),
@@ -1112,6 +1284,14 @@ def create_fine_tune_window():
     cv2.namedWindow(FINE_TUNE_WINDOW, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(FINE_TUNE_WINDOW, on_mask_mouse)
     controls = (
+        ("Brightness", 255),
+        ("Contrast", 255),
+        ("Exposure", 50),
+        ("Gain", 255),
+        ("WB Temp", 7500),
+        ("Saturation", 255),
+        ("Sharpness", 255),
+        ("Backlight", 1),
         ("Dark", 255),
         ("Light", 255),
         ("Area min", AREA_ABS_MAX),
@@ -1240,6 +1420,16 @@ def print_fine_tune_settings(title="Settings"):
     Creates: Terminal output only.
     """
     print(f"[fine-tune] {title}:")
+
+    print(f"BRIGHTNESS = {BRIGHTNESS}")
+    print(f"CONTRAST = {CONTRAST}")
+    print(f"CAMERA_EXPOSURE = {CAMERA_EXPOSURE}")
+    print(f"CAMERA_GAIN = {CAMERA_GAIN}")
+    print(f"CAMERA_WB_TEMP = {CAMERA_WB_TEMP}")
+    print(f"CAMERA_SATURATION = {CAMERA_SATURATION}")
+    print(f"CAMERA_SHARPNESS = {CAMERA_SHARPNESS}")
+    print(f"CAMERA_BACKLIGHT = {CAMERA_BACKLIGHT}")
+
     print(f"DARK_THRESHOLD = {DARK_THRESHOLD}")
     print(f"LIGHT_THRESHOLD = {LIGHT_THRESHOLD}")
     print(f"ASPECT_MIN = {ASPECT_MIN:.3f}")
@@ -1434,6 +1624,8 @@ def main():
         print("ERROR: Cannot open USB camera!")
         GPIO.cleanup()
         return
+    
+    disable_camera_auto_controls()
 
     cv2.setMouseCallback(MAIN_WINDOW, on_mouse, None)
     next_read_ts = 0.0
