@@ -1,175 +1,162 @@
-// Get DOM elements
-const vehicleTableBody = document.querySelector('#vehicleTable tbody');
-const currentRateDisplay = document.getElementById('currentRate');
-const newRateInput = document.getElementById('newRateInput');
-const updateRateBtn = document.getElementById('updateRateBtn');
+const vehicleTableBody = document.querySelector("#vehicleTable tbody");
+const currentRateDisplay = document.getElementById("currentRate");
+const newRateInput = document.getElementById("newRateInput");
+const updateRateBtn = document.getElementById("updateRateBtn");
+const rateMsg = document.getElementById("rateMsg");
 
-// Format timestamp to readable date/time
+let rateInputSeeded = false;
+
+// --- Formatting helpers ---
 function formatTimestamp(timestamp) {
-    const date = new Date(timestamp * 1000);
-    return date.toLocaleString();
+    return new Date(timestamp * 1000).toLocaleString();
 }
 
-// Update vehicle table with data
+function fmtDuration(seconds) {
+    seconds = Math.max(0, Math.round(seconds));
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    if (h && m) return `${h}h ${m}m`;
+    if (h) return `${h}h`;
+    return `${m}m`;
+}
+
+// --- Live "updated Xs ago" indicator ---
+let lastOk = 0;
+
+function markUpdated(fresh) {
+    if (fresh) lastOk = Date.now();
+    const el = document.getElementById("lastUpdated");
+    if (!el) return;
+    if (!lastOk) {
+        el.textContent = "Waiting for data…";
+        return;
+    }
+    const age = Math.round((Date.now() - lastOk) / 1000);
+    el.textContent = age < 5 ? "Updated just now" : `Updated ${age}s ago`;
+    el.classList.toggle("stale", age > 10);
+}
+
+// --- Vehicle table ---
 function updateVehicleTable() {
-    fetch('/admin/vehicles')
-        .then(response => {
-            if (!response.ok) {
-                throw new Error('Network response was not ok');
-            }
+    fetch("/admin/vehicles")
+        .then((response) => {
+            if (!response.ok) throw new Error("Network response was not ok");
             return response.json();
         })
-        .then(vehicles => {
-            // Clear existing table rows
-            vehicleTableBody.innerHTML = '';
+        .then((vehicles) => {
+            vehicleTableBody.innerHTML = "";
 
-            // Add each vehicle to the table
-            vehicles.forEach(vehicle => {
-                const row = document.createElement('tr');
-                
-                // Calculate payment status and style
-                const isPaid = vehicle.isPaid;
-                const statusClass = isPaid ? 'paid' : 'unpaid';
-                const statusText = isPaid ? 'Paid' : 'Unpaid';
+            if (!vehicles.length) {
+                vehicleTableBody.innerHTML =
+                    '<tr><td colspan="5" class="empty">No vehicles currently parked</td></tr>';
+                return;
+            }
+
+            const now = Date.now() / 1000;
+            vehicles.forEach((vehicle) => {
+                const row = document.createElement("tr");
+                const statusClass = vehicle.isPaid ? "paid" : "unpaid";
+                const statusText = vehicle.isPaid ? "Paid" : "Unpaid";
 
                 row.innerHTML = `
                     <td>${vehicle.plate.toUpperCase()}</td>
                     <td>${formatTimestamp(vehicle.timeIn)}</td>
+                    <td>${fmtDuration(now - vehicle.timeIn)}</td>
                     <td>${formatTimestamp(vehicle.paidToTime)}</td>
                     <td class="${statusClass}">${statusText}</td>
                 `;
-                
                 vehicleTableBody.appendChild(row);
             });
         })
-        .catch(error => {
-            console.error('Error fetching vehicle data:', error);
-            vehicleTableBody.innerHTML = `
-                <tr>
-                    <td colspan="4" class="error">Error loading vehicle data</td>
-                </tr>
-            `;
+        .catch((error) => {
+            console.error("Error fetching vehicle data:", error);
+            vehicleTableBody.innerHTML =
+                '<tr><td colspan="5" class="empty">Could not load vehicle data</td></tr>';
         });
 }
 
-// Update parking spots same as main page
+// --- Live parking spots ---
 function updateParkingSpots() {
-    fetch('/spots')
-        .then(response => response.json())
-        .then(data => {
+    fetch("/spots")
+        .then((response) => response.json())
+        .then((data) => {
+            let free = 0;
             Object.entries(data).forEach(([id, taken]) => {
                 const spot = document.querySelector(`.spot[data-id="${id}"]`);
-                if (spot) {
-                    if (taken) {
-                        spot.classList.add('taken');
-                        spot.classList.remove('available');
-                    } else {
-                        spot.classList.add('available');
-                        spot.classList.remove('taken');
-                    }
-                }
+                if (!spot) return;
+                spot.classList.toggle("taken", !!taken);
+                spot.classList.toggle("available", !taken);
+                spot.title = `Spot ${Number(id) + 1} — ${taken ? "taken" : "available"}`;
+                if (!taken) free++;
             });
+            const freeEl = document.getElementById("spotsFree");
+            if (freeEl) freeEl.textContent = free;
+            const summary = document.getElementById("spotsSummary");
+            if (summary) summary.classList.toggle("full", free === 0);
+            markUpdated(true);
         })
-        .catch(err => {
-            console.error('Failed to fetch spots:', err);
+        .catch((err) => {
+            console.error("Failed to fetch spots:", err);
+            markUpdated(false);
         });
 }
 
-// Add some extra styles for the admin table
-const style = document.createElement('style');
-style.textContent = `
-    #vehicleTable {
-        width: 100%;
-        border-collapse: collapse;
-        margin-top: 1rem;
-    }
-
-    #vehicleTable th,
-    #vehicleTable td {
-        padding: 0.5rem;
-        text-align: left;
-        border-bottom: 1px solid #ddd;
-    }
-
-    #vehicleTable th {
-        background-color: #0074D9;
-        color: white;
-    }
-
-    #vehicleTable tr:nth-child(even) {
-        background-color: #f8f9fa;
-    }
-
-    #vehicleTable .paid {
-        color: #2ECC40;
-        font-weight: bold;
-    }
-
-    #vehicleTable .unpaid {
-        color: #FF4136;
-        font-weight: bold;
-    }
-
-    #vehicleTable .error {
-        color: #FF4136;
-        text-align: center;
-        padding: 1rem;
-    }
-
-    @media (max-width: 1200px) {
-        #vehicleTable {
-            font-size: 0.8em;
-        }
-    }
-`;
-document.head.appendChild(style);
-
-// Update hourly rate display
+// --- Hourly rate ---
 function updateHourlyRateDisplay() {
-    fetch('/hourly-rate')
-        .then(response => response.json())
-        .then(data => {
+    fetch("/hourly-rate")
+        .then((response) => response.json())
+        .then((data) => {
             currentRateDisplay.textContent = `$${data.hourlyRate.toFixed(2)}`;
+            if (!rateInputSeeded && !newRateInput.value) {
+                newRateInput.value = data.hourlyRate;
+                rateInputSeeded = true;
+            }
         })
-        .catch(error => {
-            console.error('Error fetching hourly rate:', error);
-        });
+        .catch((error) => console.error("Error fetching hourly rate:", error));
 }
 
-// Handle rate update
-updateRateBtn.addEventListener('click', () => {
+function showRateMsg(text, isError) {
+    rateMsg.textContent = text;
+    rateMsg.classList.toggle("stale", !!isError);
+    clearTimeout(showRateMsg._t);
+    showRateMsg._t = setTimeout(() => {
+        rateMsg.textContent = "";
+        rateMsg.classList.remove("stale");
+    }, 4000);
+}
+
+updateRateBtn.addEventListener("click", () => {
     const newRate = parseFloat(newRateInput.value);
     if (isNaN(newRate) || newRate <= 0) {
-        alert('Please enter a valid rate greater than 0');
+        showRateMsg("Enter a rate greater than 0.", true);
         return;
     }
 
-    fetch('/hourly-rate', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ hourlyRate: newRate })
+    updateRateBtn.disabled = true;
+    fetch("/hourly-rate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hourlyRate: newRate }),
     })
-    .then(response => response.json())
-    .then(data => {
-        if (data.error) {
-            throw new Error(data.error);
-        }
-        updateHourlyRateDisplay();
-        alert('Hourly rate updated successfully');
-    })
-    .catch(error => {
-        console.error('Error updating rate:', error);
-        alert('Failed to update rate: ' + error.message);
-    });
+        .then((response) => response.json())
+        .then((data) => {
+            if (data.error) throw new Error(data.error);
+            updateHourlyRateDisplay();
+            showRateMsg(`Rate updated to $${newRate.toFixed(2)}/hr.`);
+        })
+        .catch((error) => {
+            console.error("Error updating rate:", error);
+            showRateMsg(`Failed to update rate: ${error.message}`, true);
+        })
+        .finally(() => {
+            updateRateBtn.disabled = false;
+        });
 });
 
-// Initial updates
+// --- Init + polling ---
 updateVehicleTable();
 updateParkingSpots();
 updateHourlyRateDisplay();
-
-// Refresh data periodically
-setInterval(updateVehicleTable, 5000);  // every 5 seconds
-setInterval(updateParkingSpots, 1000);  // every 1 second
+setInterval(updateVehicleTable, 5000);
+setInterval(updateParkingSpots, 1000);
+setInterval(() => markUpdated(false), 1000);

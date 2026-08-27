@@ -27,8 +27,8 @@
                     <p>message</p>
                 </div>
                 <div id="infoBox" class="info-box hidden">
-                    <p><strong>Time Parked:</strong> <span id="timeParked">--</span></p>
-                    <p><strong>Total Due:</strong> $<span id="totalDue">--</span></p>
+                    <p><strong>Unpaid time:</strong> <span id="timeParked">--</span></p>
+                    <p><strong>Total due:</strong> <span id="totalDue">--</span></p>
                     <button id="payBtn">Pay Now</button>
                 </div>
             </div>
@@ -42,6 +42,13 @@
         <!-- RIGHT PANEL -->
         <section class="right-panel">
             <h2>Parking Spots</h2>
+            <div class="spots-summary" id="spotsSummary">
+                <span id="spotsFree">&ndash;</span> of 16 spots free
+            </div>
+            <div class="legend">
+                <span><span class="swatch available"></span> Available</span>
+                <span><span class="swatch taken"></span> Taken</span>
+            </div>
             <table id="parkingTable">
                 <tbody>
                     <!-- Row 1 -->
@@ -78,6 +85,7 @@
                     </tr>
                 </tbody>
             </table>
+            <p class="muted" id="lastUpdated">Waiting for data&hellip;</p>
         </section>
     </main>
 

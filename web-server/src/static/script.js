@@ -9,12 +9,25 @@ const successMessage = document.getElementById("successMessage");
 const newPaymentBtn = document.getElementById("newPaymentBtn");
 const paymentForm = document.getElementById("paymentForm");
 
-let parkingRate = 999;
+let parkingRate = 0;
 
-// --- Helper function to show messages ---
+// --- Formatting helpers ---
+function fmtDuration(seconds) {
+    seconds = Math.max(0, Math.round(seconds));
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    if (h && m) return `${h}h ${m}m`;
+    if (h) return `${h}h`;
+    return `${m}m`;
+}
+
+function money(n) {
+    return `$${Math.max(0, n).toFixed(2)}`;
+}
+
+// --- Message helpers ---
 function showMessage(message, type = "info") {
-    messageBox.classList.remove("hidden");
-    messageBox.style.backgroundColor = type === "error" ? "#ffdddd" : "#eef6ff";
+    messageBox.className = `info-box ${type}`;
     messageBox.innerHTML = `<p>${message}</p>`;
 }
 
@@ -25,11 +38,11 @@ function hideMessage() {
 function hideInfoBox() {
     infoBox.classList.add("hidden");
 }
+
 // --- Check button ---
 checkBtn.addEventListener("click", async () => {
     const plate = plateInput.value.trim();
 
-    // If input is empty
     if (!plate) {
         showMessage("Please enter a number plate.", "error");
         hideInfoBox();
@@ -37,41 +50,33 @@ checkBtn.addEventListener("click", async () => {
     }
 
     try {
-        // Call the Flask endpoint
-        const response = await fetch(`/check_plate/${plate}`);
-        if (!response.ok) {
-            throw new Error("Failed to check plate.");
-        }
-
+        const response = await fetch(`/check_plate/${encodeURIComponent(plate)}`);
+        if (!response.ok) throw new Error("Failed to check plate.");
         const data = await response.json();
 
-        if (data.exists) {
-            // Plate exists
-            const totalSeconds = data.timeOwed;
-            if (data.paid) {
-                // Car is paid up, no payment needed
-                console.log(`Paid up ${totalSeconds}`)
-                const minutesPaid = 0 - Math.floor((totalSeconds % 3600) / 60);
-                showMessage(`Plate ${plate} is paid up for the next ${minutesPaid} minute${minutesPaid !== 1 ? 's' : ''}. No payment required.`);
-                plateInput.value = ""; // clear input after checking
-            } else {
-                hideMessage();
-                // Show time parked and placeholder total due
-                const hours = Math.round(totalSeconds / 3600);
-                const minutes = Math.ceil((totalSeconds % 3600) / 60);
-                timeParked.textContent = `${hours} hour${hours !== 1 ? 's' : ''} ${minutes} min${minutes !== 1 ? 's' : ''}`;
-                console.log((Math.round(hours * parkingRate) + (minutes/60 * parkingRate)));
-                totalDue.textContent = `${((Math.round(hours * parkingRate) + (minutes/60 * parkingRate)).toFixed(2))}`; // Rounds to 2 decimal places
-                infoBox.style.backgroundColor = "#eef6ff"; // info color
-                infoBox.classList.remove("hidden");
-            }
-
-        } else {
-            // Plate does not exist
-            showMessage(`Plate ${plate} not found in database.`, "error");
+        if (!data.exists) {
+            showMessage(`Plate ${plate.toUpperCase()} was not found.`, "error");
             hideInfoBox();
+            return;
         }
 
+        // timeOwed > 0  => unpaid time owed, in seconds
+        // timeOwed <= 0 => paid ahead by that many seconds
+        if (data.paid || data.timeOwed <= 0) {
+            const remaining = fmtDuration(-data.timeOwed);
+            showMessage(
+                `Plate ${plate.toUpperCase()} is paid up (${remaining} remaining). No payment required.`,
+                "success"
+            );
+            hideInfoBox();
+            plateInput.value = "";
+            return;
+        }
+
+        hideMessage();
+        timeParked.textContent = fmtDuration(data.timeOwed);
+        totalDue.textContent = money((data.timeOwed / 3600) * parkingRate);
+        infoBox.classList.remove("hidden");
     } catch (err) {
         console.error(err);
         showMessage("Error checking plate. See console for details.", "error");
@@ -79,75 +84,24 @@ checkBtn.addEventListener("click", async () => {
     }
 });
 
-// Periodically fetch parking spot status and update UI
-function updateParkingSpots() {
-    fetch('/spots')
-        .then(response => response.json())
-        .then(data => {
-            // data is an object: { '1': false, '2': true, ... }
-            Object.entries(data).forEach(([id, taken]) => {
-                const spot = document.querySelector(`.spot[data-id="${id}"]`);
-                if (spot) {
-                    if (taken) {
-                        spot.classList.add('taken');
-                        spot.classList.remove('available');
-                    } else {
-                        spot.classList.add('available');
-                        spot.classList.remove('taken');
-                    }
-                }
-            });
-        })
-        .catch(err => {
-            // Optionally handle error
-            // console.error('Failed to fetch spots:', err);
-        });
-}
-
-// Poll every 5 seconds
-setInterval(updateParkingSpots, 1000);
-setInterval(updateParkingRate, 4000)
-
-function updateParkingRate() {
-    fetch('/hourly-rate')
-        .then(response => response.json())
-        .then(data => {
-            console.log(data.hourlyRate)
-            parkingRate = data.hourlyRate
-        })
-}
-// Initial call on page load
-window.addEventListener('DOMContentLoaded', updateParkingSpots);
-
 // --- Pay button ---
 payBtn.addEventListener("click", async () => {
     const plate = plateInput.value.trim();
-
     if (!plate) {
         showMessage("No plate to pay for.", "error");
         return;
     }
 
     try {
-        // Send payment request to Flask
-        const response = await fetch(`/pay/${plate}`);
-        if (!response.ok) {
-            throw new Error("Payment failed.");
-        }
+        const response = await fetch(`/pay/${encodeURIComponent(plate)}`);
+        if (!response.ok) throw new Error("Payment failed.");
+        await response.json();
 
-        const data = await response.json();
-        console.log(`Payment successful for plate ${plate}`, data);
-
-        // Hide payment form & show success message
-        infoBox.classList.add("hidden");
-        messageBox.classList.add("hidden");
+        hideInfoBox();
+        hideMessage();
         paymentForm.querySelector(".form-group").style.display = "none";
         successMessage.classList.remove("hidden");
-
-        // Optionally, you could display the paidToTime returned
-        // e.g., showMessage(`Paid until: ${new Date(data.paidToTime * 1000).toLocaleTimeString()}`);
-        plateInput.value = ""; // clear input after checking
-
+        plateInput.value = "";
     } catch (err) {
         console.error(err);
         showMessage("Error during payment. See console for details.", "error");
@@ -156,12 +110,65 @@ payBtn.addEventListener("click", async () => {
 
 // --- Pay for another car ---
 newPaymentBtn.addEventListener("click", () => {
-    // Reset form
     plateInput.value = "";
-    infoBox.classList.add("hidden");
-    messageBox.classList.add("hidden");
+    hideInfoBox();
+    hideMessage();
     paymentForm.querySelector(".form-group").style.display = "block";
     successMessage.classList.add("hidden");
 });
 
-updateParkingRate()
+// --- Live parking spots ---
+let lastOk = 0;
+
+function markUpdated(fresh) {
+    if (fresh) lastOk = Date.now();
+    const el = document.getElementById("lastUpdated");
+    if (!el) return;
+    if (!lastOk) {
+        el.textContent = "Waiting for data…";
+        return;
+    }
+    const age = Math.round((Date.now() - lastOk) / 1000);
+    el.textContent = age < 5 ? "Updated just now" : `Updated ${age}s ago`;
+    el.classList.toggle("stale", age > 10);
+}
+
+function updateParkingSpots() {
+    fetch("/spots")
+        .then((response) => response.json())
+        .then((data) => {
+            let free = 0;
+            Object.entries(data).forEach(([id, taken]) => {
+                const spot = document.querySelector(`.spot[data-id="${id}"]`);
+                if (!spot) return;
+                spot.classList.toggle("taken", !!taken);
+                spot.classList.toggle("available", !taken);
+                spot.title = `Spot ${Number(id) + 1} — ${taken ? "taken" : "available"}`;
+                if (!taken) free++;
+            });
+            const freeEl = document.getElementById("spotsFree");
+            if (freeEl) freeEl.textContent = free;
+            const summary = document.getElementById("spotsSummary");
+            if (summary) summary.classList.toggle("full", free === 0);
+            markUpdated(true);
+        })
+        .catch((err) => {
+            console.error("Failed to fetch spots:", err);
+            markUpdated(false);
+        });
+}
+
+function updateParkingRate() {
+    fetch("/hourly-rate")
+        .then((response) => response.json())
+        .then((data) => {
+            parkingRate = data.hourlyRate;
+        })
+        .catch((err) => console.error("Failed to fetch rate:", err));
+}
+
+updateParkingSpots();
+updateParkingRate();
+setInterval(updateParkingSpots, 1000);
+setInterval(updateParkingRate, 4000);
+setInterval(() => markUpdated(false), 1000);
