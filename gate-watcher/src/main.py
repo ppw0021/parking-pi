@@ -1,5 +1,5 @@
 '''
-GateWatcher v0.0.11 (20251019_1330):
+GateWatcher v0.0.12 (20260827_1113):
 The code monitors the gates of a parking lot.
 If a license plate is detected on the right part of the creen,
 It means a car is entering, so the code will issue a call to the server:
@@ -158,10 +158,12 @@ GPIO.setup(SERVO_EXIT_PIN,  GPIO.OUT)
 from leds import LedControl
 led = LedControl(ENTRY_LED_PINS, EXIT_LED_PINS)
 # ---------------- Configuration --------------------------------------------
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
+CAMERA_DEVICE = f"/dev/video{CAMERA_INDEX}"
 # WEB_PI_IP = "http://10.138.63.88" # old location
 # WEB_PI_IP = "http://192.168.1.16"    # current location
-WEB_PI_IP =  "http://10.130.1.206"
+# WEB_PI_IP =  "http://10.130.1.206"
+WEB_PI_IP =  "http://10.0.0.2"
 URL = f"{WEB_PI_IP}:5000"
 ASPECT_MIN = 2.0
 ASPECT_MAX = 6.0
@@ -194,15 +196,26 @@ TESS_CFG_FALLBACK = (
     "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 # Image area settings (bbox area filter controlled by [ / ])
-AREA_MIN     = 7000
-AREA_MAX     = 10000
+AREA_MIN     = 7300
+AREA_MAX     = 12000
 AREA_STEP    = 500
 AREA_ABS_MIN = 500
 AREA_ABS_MAX = 40000
 area_min = AREA_MIN
 area_max = AREA_MAX
-CONTRAST = 225
-BRIGHTNESS = 105
+CONTRAST = 245
+BRIGHTNESS = 85
+
+# Fine-tune image processing settings
+DARK_THRESHOLD = 128
+LIGHT_THRESHOLD = 240
+CANNY_LOW = 64
+CANNY_HIGH = 200
+DILATION_ITERATIONS = 2
+FINE_TUNE_PRINT_PERIOD = 0.5
+FINE_TUNE_WINDOW = "Fine Tune Masks"
+MAIN_WINDOW = "Gate Watcher"
+
 # Camera
 CAMERA_RESOLUTION = (1280, 720)
 # Anti-spam controls
@@ -233,18 +246,65 @@ aggr_right = {'samples': [], 'start_ts': 0.0,
 show_zones = True
 # Manual selection (mouse)
 last_mouse_pos = None
+# Fine-tune state
+fine_tune_active = False
+fine_tune_dragging = False
+fine_tune_start = None
+fine_tune_rect = None
+fine_tune_last_print = 0.0
+fine_tune_input_mode = None
+fine_tune_input_text = ""
+fine_tune_trackbar_update = False
+main_keyboard_active = True
+
 # ---- Mouse callback --------------------------------------------------------
 def on_mouse(event, x, y, flags, param):
     """
     Function: on_mouse
-    Purpose: Track mouse pointer position for manual spot selection.
-    Methods: cv2.setMouseCallback; store latest (x, y).
-    Creates: updates global last_mouse_pos.
+    Purpose: Track the pointer and select a calibration rectangle.
+    Methods: Store mouse coordinates and process drag events while the
+             fine-tune mode is active.
+    Creates: Updates last_mouse_pos and fine-tune rectangle state.
     """
-    global last_mouse_pos
-    if event in (cv2.EVENT_MOUSEMOVE, cv2.EVENT_LBUTTONDOWN,
-                 cv2.EVENT_RBUTTONDOWN):
+    global last_mouse_pos, main_keyboard_active
+    global fine_tune_dragging, fine_tune_start, fine_tune_rect
+
+    main_keyboard_active = True
+
+    if event in (
+        cv2.EVENT_MOUSEMOVE,
+        cv2.EVENT_LBUTTONDOWN,
+        cv2.EVENT_LBUTTONUP,
+        cv2.EVENT_RBUTTONDOWN,
+    ):
         last_mouse_pos = (x, y)
+
+    if not fine_tune_active:
+        return
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+        fine_tune_dragging = True
+        fine_tune_start = (x, y)
+        fine_tune_rect = (x, y, 0, 0)
+    elif event == cv2.EVENT_MOUSEMOVE and fine_tune_dragging:
+        x0, y0 = fine_tune_start
+        fine_tune_rect = (
+            min(x0, x),
+            min(y0, y),
+            abs(x - x0),
+            abs(y - y0),
+        )
+    elif event == cv2.EVENT_LBUTTONUP and fine_tune_dragging:
+        fine_tune_dragging = False
+        x0, y0 = fine_tune_start
+        fine_tune_rect = (
+            min(x0, x),
+            min(y0, y),
+            abs(x - x0),
+            abs(y - y0),
+        )
+        apply_fine_tune_selection(param, fine_tune_rect)
+
 # ---- Helpers ---------------------------------------------------------------
 def set_gate(gate_id: int, close: bool):
     """
@@ -293,7 +353,7 @@ def set_brightness(value):
     """
     value = max(0, min(255, value))
     subprocess.call([
-        "v4l2-ctl", "--device=/dev/video0",
+        "v4l2-ctl", f"--device={CAMERA_DEVICE}",
         "--set-ctrl", f"brightness={value}"
     ])
     print(f"Brightness: {value}")
@@ -307,7 +367,7 @@ def set_contrast(value):
     """
     value = max(0, min(255, value))
     subprocess.call([
-        "v4l2-ctl", "--device=/dev/video0",
+        "v4l2-ctl", f"--device={CAMERA_DEVICE}",
         "--set-ctrl", f"contrast={value}"
     ])
     print(f"Contrast: {value}")
@@ -321,7 +381,7 @@ def set_gain(value):
     """
     value = max(0, min(255, value))
     subprocess.call([
-        "v4l2-ctl", "--device=/dev/video0",
+        "v4l2-ctl", f"--device={CAMERA_DEVICE}",
         "--set-ctrl", f"gain={value}"
     ])
     print(f"Gain: {value}")
@@ -351,35 +411,55 @@ def preprocess_roi(roi_bgr):
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k, iterations=1)
     return th
+def make_detection_masks(frame_bgr):
+    """
+    Function: make_detection_masks
+    Purpose: Build every mask used by the plate candidate detector.
+    Methods: Convert to grayscale, threshold dark and light pixels,
+             combine both masks, detect edges, and dilate the result.
+    Creates: Dark, light, edge, and combined binary masks.
+    """
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    dark_mask = cv2.inRange(gray, 0, DARK_THRESHOLD)
+    light_mask = cv2.inRange(gray, LIGHT_THRESHOLD, 255)
+    contrast_mask = cv2.bitwise_or(dark_mask, light_mask)
+    edges = cv2.Canny(contrast_mask, CANNY_LOW, CANNY_HIGH)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    combined = cv2.dilate(
+        edges,
+        kernel,
+        iterations=max(0, DILATION_ITERATIONS),
+    )
+    return dark_mask, light_mask, edges, combined
+
+
 def find_plate_candidates(frame_bgr):
     """
     Function: find_plate_candidates
     Purpose: Detect rectangular regions that may contain a plate.
-    Methods: Gray -> white mask -> Canny -> dilate -> contours;
-    bbox area (w*h) filter with area_min/area_max; aspect filter;
-    return top-N by bbox area.
-    Creates: boxes list of (x, y, w, h).
+    Methods: Build adjustable masks, find external contours, apply area
+             and aspect filters, then retain the largest candidates.
+    Creates: A list of candidate boxes in (x, y, w, h) format.
     """
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    _, binary_mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-    combined = cv2.bitwise_and(gray, binary_mask)
-    edges = cv2.Canny(combined, 80, 200)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    edges = cv2.dilate(edges, k, iterations=1)
-    cnts, _ = cv2.findContours(
-        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    _, _, _, combined = make_detection_masks(frame_bgr)
+    contours, _ = cv2.findContours(
+        combined,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
     )
     boxes = []
-    for c in cnts:
-        x, y, w, h = cv2.boundingRect(c)
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
         bbox_area = int(w) * int(h)
         if bbox_area < area_min or bbox_area > area_max:
             continue
         aspect = w / max(h, 1)
         if ASPECT_MIN <= aspect <= ASPECT_MAX:
             boxes.append((x, y, w, h))
-    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
+    boxes.sort(key=lambda box: box[2] * box[3], reverse=True)
     return boxes[:MAX_CANDIDATES]
+
+
 def ocr_text_and_conf(img_bin):
     """
     Function: ocr_text_and_conf
@@ -436,6 +516,7 @@ def smart_swap(chars):
     LET_TO_DIG = {
         'O': '0', 'I': '1', 'Z': '2', 'E': '3', 'A': '4',
         'S': '5', 'G': '6', 'T': '7', 'B': '8', 'Q': '0',
+        'L': '1',
     }
     out = []
     for i, ch in enumerate(s):
@@ -703,8 +784,17 @@ def ocr_bbox(frame, box, side_hint=None):
     forward alias downstream.
     Creates: returns (plate_alias, conf, x_left, x_center).
     """
-    (x, y, w, h) = box
-    roi = frame[y:y + h, x:x + w]
+    x, y, w, h = box
+
+    pad_x = max(4, int(w * 0.08))
+    pad_y = max(4, int(h * 0.12))
+
+    x1 = max(0, x - pad_x)
+    y1 = max(0, y - pad_y)
+    x2 = min(frame.shape[1], x + w + pad_x)
+    y2 = min(frame.shape[0], y + h + pad_y)
+
+    roi = frame[y1:y2, x1:x2]
     if side_hint == 'exit':
         roi = cv2.rotate(roi, cv2.ROTATE_180)
     roi = cv2.resize(
@@ -910,154 +1000,558 @@ def manual_select_and_process(frame, boxes):
         handle_candidate(p, x_center, frame.shape[1])
     else:
         print("Manual select: OCR empty for chosen box.")
+def on_mask_mouse(event, x, y, flags, param):
+    """
+    Function: on_mask_mouse
+    Purpose: Disable hotkeys while the mask window is being used.
+    Methods: Mark the main window inactive on any mask-window mouse event.
+    Creates: Updated main_keyboard_active state.
+    """
+    global main_keyboard_active
+
+    main_keyboard_active = False
+
+
+def fine_tune_trackbar_changed(_value):
+    """
+    Function: fine_tune_trackbar_changed
+    Purpose: Copy trackbar positions into processing settings.
+    Methods: Read all controls and enforce valid minimum/maximum pairs.
+    Creates: Updated global image-processing constants.
+    """
+    global DARK_THRESHOLD, LIGHT_THRESHOLD
+    global CANNY_LOW, CANNY_HIGH, DILATION_ITERATIONS
+    global ASPECT_MIN, ASPECT_MAX, area_min, area_max
+    global fine_tune_trackbar_update, main_keyboard_active
+
+    main_keyboard_active = False
+    if fine_tune_trackbar_update:
+        return
+
+    DARK_THRESHOLD = cv2.getTrackbarPos("Dark", FINE_TUNE_WINDOW)
+    LIGHT_THRESHOLD = cv2.getTrackbarPos("Light", FINE_TUNE_WINDOW)
+    CANNY_LOW = cv2.getTrackbarPos("Canny low", FINE_TUNE_WINDOW)
+    CANNY_HIGH = cv2.getTrackbarPos("Canny high", FINE_TUNE_WINDOW)
+    DILATION_ITERATIONS = cv2.getTrackbarPos(
+        "Dilation",
+        FINE_TUNE_WINDOW,
+    )
+    area_min = max(
+        AREA_ABS_MIN,
+        cv2.getTrackbarPos("Area min", FINE_TUNE_WINDOW),
+    )
+    area_max = max(
+        area_min,
+        cv2.getTrackbarPos("Area max", FINE_TUNE_WINDOW),
+    )
+    ASPECT_MIN = max(
+        0.1,
+        cv2.getTrackbarPos("Aspect min x100", FINE_TUNE_WINDOW) / 100.0,
+    )
+    ASPECT_MAX = max(
+        ASPECT_MIN,
+        cv2.getTrackbarPos("Aspect max x100", FINE_TUNE_WINDOW) / 100.0,
+    )
+
+
+def sync_fine_tune_trackbars():
+    """
+    Function: sync_fine_tune_trackbars
+    Purpose: Make every trackbar show the current processing value.
+    Methods: Temporarily block callbacks and set each control position.
+    Creates: Updated GUI trackbar positions.
+    """
+    global fine_tune_trackbar_update
+
+    fine_tune_trackbar_update = True
+    values = (
+        ("Dark", int(DARK_THRESHOLD)),
+        ("Light", int(LIGHT_THRESHOLD)),
+        ("Area min", int(area_min)),
+        ("Area max", int(area_max)),
+        ("Aspect min x100", int(round(ASPECT_MIN * 100))),
+        ("Aspect max x100", int(round(ASPECT_MAX * 100))),
+        ("Canny low", int(CANNY_LOW)),
+        ("Canny high", int(CANNY_HIGH)),
+        ("Dilation", int(DILATION_ITERATIONS)),
+    )
+    for name, value in values:
+        cv2.setTrackbarPos(name, FINE_TUNE_WINDOW, value)
+    fine_tune_trackbar_update = False
+
+
+def create_fine_tune_window():
+    """
+    Function: create_fine_tune_window
+    Purpose: Open the mask window and create processing trackbars.
+    Methods: Create an OpenCV window and integer-valued controls.
+    Creates: Fine Tune Masks window and its trackbars.
+    """
+    global fine_tune_trackbar_update
+
+    fine_tune_trackbar_update = True
+    cv2.namedWindow(FINE_TUNE_WINDOW, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(FINE_TUNE_WINDOW, on_mask_mouse)
+    controls = (
+        ("Dark", 255),
+        ("Light", 255),
+        ("Area min", AREA_ABS_MAX),
+        ("Area max", AREA_ABS_MAX),
+        ("Aspect min x100", 1000),
+        ("Aspect max x100", 1000),
+        ("Canny low", 255),
+        ("Canny high", 255),
+        ("Dilation", 5),
+    )
+    for name, maximum in controls:
+        cv2.createTrackbar(
+            name,
+            FINE_TUNE_WINDOW,
+            0,
+            maximum,
+            fine_tune_trackbar_changed,
+        )
+    fine_tune_trackbar_update = False
+    sync_fine_tune_trackbars()
+
+
+def apply_fine_tune_selection(frame, rect):
+    """
+    Function: apply_fine_tune_selection
+    Purpose: Derive processing limits from a selected plate rectangle.
+    Methods: Apply ten-percent area and aspect margins and robust five
+             and ninety-five percent grayscale extrema.
+    Creates: Updated thresholds, ranges, and synchronized trackbars.
+    """
+    global DARK_THRESHOLD, LIGHT_THRESHOLD
+    global ASPECT_MIN, ASPECT_MAX, area_min, area_max
+
+    if frame is None or rect is None:
+        return
+    x, y, w, h = rect
+    if w < 5 or h < 5:
+        print("[fine-tune] Selection is too small.")
+        return
+    x2 = min(frame.shape[1], x + w)
+    y2 = min(frame.shape[0], y + h)
+    roi = frame[max(0, y):y2, max(0, x):x2]
+    if roi.size == 0:
+        return
+
+    selected_area = w * h
+    selected_aspect = w / max(h, 1)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    darkest = float(np.percentile(gray, 5))
+    lightest = float(np.percentile(gray, 95))
+    color_range = max(1.0, lightest - darkest)
+
+    area_min = max(AREA_ABS_MIN, int(selected_area * 0.90))
+    area_max = min(AREA_ABS_MAX, int(selected_area * 1.10))
+    ASPECT_MIN = max(0.1, selected_aspect * 0.90)
+    ASPECT_MAX = selected_aspect * 1.10
+    DARK_THRESHOLD = int(np.clip(darkest + color_range * 0.10, 0, 255))
+    LIGHT_THRESHOLD = int(np.clip(lightest - color_range * 0.10, 0, 255))
+    sync_fine_tune_trackbars()
+
+    print(f"[fine-tune] Selected ROI: x={x} y={y} w={w} h={h}")
+    print(
+        f"[fine-tune] Measured area={selected_area}, "
+        f"aspect={selected_aspect:.3f}"
+    )
+    print(
+        f"[fine-tune] Gray percentiles: "
+        f"5%={darkest:.1f}, 95%={lightest:.1f}"
+    )
+    print_fine_tune_settings("Applied settings")
+
+
+def labelled_mask(mask, label):
+    """
+    Function: labelled_mask
+    Purpose: Prepare one half-size mask tile with a readable label.
+    Methods: Resize, convert grayscale to BGR, and draw a dark label bar.
+    Creates: A labelled BGR image tile.
+    """
+    tile = cv2.resize(
+        mask,
+        None,
+        fx=0.5,
+        fy=0.5,
+        interpolation=cv2.INTER_NEAREST,
+    )
+    tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
+    cv2.rectangle(tile, (0, 0), (220, 30), (0, 0, 0), -1)
+    cv2.putText(
+        tile,
+        label,
+        (8, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return tile
+
+
+def show_fine_tune_masks(frame):
+    """
+    Function: show_fine_tune_masks
+    Purpose: Show dark, light, edge, and combined masks in a 2x2 grid.
+    Methods: Build detector masks, label half-size tiles, and concatenate.
+    Creates: Updated Fine Tune Masks window contents.
+    """
+    dark, light, edges, combined = make_detection_masks(frame)
+    top = np.hstack((
+        labelled_mask(dark, "Dark mask"),
+        labelled_mask(light, "Light mask"),
+    ))
+    bottom = np.hstack((
+        labelled_mask(edges, "Edges"),
+        labelled_mask(combined, "Combined mask"),
+    ))
+    cv2.imshow(FINE_TUNE_WINDOW, np.vstack((top, bottom)))
+
+
+def print_fine_tune_settings(title="Settings"):
+    """
+    Function: print_fine_tune_settings
+    Purpose: Print copy-ready image-processing settings.
+    Methods: Format all adjustable constants and ranges.
+    Creates: Terminal output only.
+    """
+    print(f"[fine-tune] {title}:")
+    print(f"DARK_THRESHOLD = {DARK_THRESHOLD}")
+    print(f"LIGHT_THRESHOLD = {LIGHT_THRESHOLD}")
+    print(f"ASPECT_MIN = {ASPECT_MIN:.3f}")
+    print(f"ASPECT_MAX = {ASPECT_MAX:.3f}")
+    print(f"area_min = {area_min}")
+    print(f"area_max = {area_max}")
+    print(f"CANNY_LOW = {CANNY_LOW}")
+    print(f"CANNY_HIGH = {CANNY_HIGH}")
+    print(f"DILATION_ITERATIONS = {DILATION_ITERATIONS}")
+
+
+def toggle_fine_tune():
+    """
+    Function: toggle_fine_tune
+    Purpose: Enter or leave interactive detector calibration mode.
+    Methods: Create or destroy the mask window and print final settings.
+    Creates: Updated fine_tune_active state.
+    """
+    global fine_tune_active, fine_tune_input_mode, fine_tune_input_text
+
+    fine_tune_active = not fine_tune_active
+    fine_tune_input_mode = None
+    fine_tune_input_text = ""
+    if fine_tune_active:
+        create_fine_tune_window()
+        print("[fine-tune] ON. Drag around a plate in Gate Watcher.")
+    else:
+        print_fine_tune_settings("Final settings")
+        cv2.destroyWindow(FINE_TUNE_WINDOW)
+        print("[fine-tune] OFF.")
+
+
+def start_numeric_input(mode):
+    """
+    Function: start_numeric_input
+    Purpose: Start non-blocking numeric entry over the main video.
+    Methods: Record the requested setting name and clear the input text.
+    Creates: Updated fine_tune_input_mode and fine_tune_input_text.
+    """
+    global fine_tune_input_mode, fine_tune_input_text
+
+    fine_tune_input_mode = mode
+    fine_tune_input_text = ""
+
+
+def apply_numeric_input():
+    """
+    Function: apply_numeric_input
+    Purpose: Apply typed threshold, area, or ratio values.
+    Methods: Parse one central value with a ten-percent margin or parse
+             two explicit range endpoints.
+    Creates: Updated processing settings and synchronized trackbars.
+    """
+    global DARK_THRESHOLD, LIGHT_THRESHOLD
+    global ASPECT_MIN, ASPECT_MAX, area_min, area_max
+    global fine_tune_input_mode, fine_tune_input_text
+
+    parts = fine_tune_input_text.replace(",", " ").split()
+    try:
+        values = [float(part) for part in parts]
+        if fine_tune_input_mode == "DARK" and len(values) == 1:
+            DARK_THRESHOLD = int(np.clip(values[0], 0, 255))
+        elif fine_tune_input_mode == "LIGHT" and len(values) == 1:
+            LIGHT_THRESHOLD = int(np.clip(values[0], 0, 255))
+        elif fine_tune_input_mode == "RATIO" and len(values) == 1:
+            ASPECT_MIN = max(0.1, values[0] * 0.90)
+            ASPECT_MAX = values[0] * 1.10
+        elif fine_tune_input_mode == "RATIO" and len(values) == 2:
+            ASPECT_MIN, ASPECT_MAX = sorted(values)
+        elif fine_tune_input_mode == "AREA" and len(values) == 1:
+            area_min = max(AREA_ABS_MIN, int(values[0] * 0.90))
+            area_max = min(AREA_ABS_MAX, int(values[0] * 1.10))
+        elif fine_tune_input_mode == "AREA" and len(values) == 2:
+            low, high = sorted(int(value) for value in values)
+            area_min = max(AREA_ABS_MIN, low)
+            area_max = min(AREA_ABS_MAX, high)
+        else:
+            raise ValueError("wrong number of values")
+        sync_fine_tune_trackbars()
+        print_fine_tune_settings("Manual setting applied")
+    except ValueError:
+        print(
+            f"[fine-tune] Invalid {fine_tune_input_mode} value: "
+            f"{fine_tune_input_text!r}"
+        )
+    fine_tune_input_mode = None
+    fine_tune_input_text = ""
+
+
+def process_fine_tune_key(key):
+    """
+    Function: process_fine_tune_key
+    Purpose: Process calibration hotkeys and non-blocking numeric input.
+    Methods: Handle printable characters, Enter, Backspace, and Escape.
+    Creates: Updated input state or processing constants.
+    """
+    global fine_tune_input_mode, fine_tune_input_text
+
+    if fine_tune_input_mode is not None:
+        if key in (10, 13):
+            apply_numeric_input()
+        elif key in (8, 127):
+            fine_tune_input_text = fine_tune_input_text[:-1]
+        elif key == 27:
+            fine_tune_input_mode = None
+            fine_tune_input_text = ""
+        elif 32 <= key <= 126:
+            char = chr(key)
+            if char in "0123456789., -":
+                fine_tune_input_text += char
+        return True
+
+    if key in (ord("b"), ord("B")):
+        start_numeric_input("DARK")
+    elif key in (ord("w"), ord("W")):
+        start_numeric_input("LIGHT")
+    elif key in (ord("r"), ord("R")):
+        start_numeric_input("RATIO")
+    elif key in (ord("a"), ord("A")):
+        start_numeric_input("AREA")
+    else:
+        return False
+    return True
+
+
+def draw_fine_tune_hud(vis, boxes):
+    """
+    Function: draw_fine_tune_hud
+    Purpose: Draw calibration status, selection, and numeric input.
+    Methods: Draw text overlays and the selected rectangle in place.
+    Creates: Updated visualization frame.
+    """
+    if fine_tune_rect is not None:
+        x, y, w, h = fine_tune_rect
+        cv2.rectangle(vis, (x, y), (x + w, y + h), (255, 0, 255), 2)
+    lines = [
+        "FINE TUNE: D=leave, drag=sample, B/W/R/A=numeric input",
+        f"dark={DARK_THRESHOLD} light={LIGHT_THRESHOLD} "
+        f"area={area_min}..{area_max}",
+        f"aspect={ASPECT_MIN:.2f}..{ASPECT_MAX:.2f} "
+        f"canny={CANNY_LOW}..{CANNY_HIGH} boxes={len(boxes)}",
+    ]
+    if fine_tune_input_mode is not None:
+        lines.append(
+            f"{fine_tune_input_mode}: {fine_tune_input_text}_"
+        )
+    for index, line in enumerate(lines):
+        y = 24 + index * 25
+        cv2.rectangle(vis, (5, y - 20), (900, y + 5), (0, 0, 0), -1)
+        cv2.putText(
+            vis,
+            line,
+            (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+
 # ---- Main loop -------------------------------------------------------------
 def main():
     """
     Function: main
-    Purpose: Always show video feed; in IDLE do display-only (no OCR,
-    no plate detection, no server); in active modes run full
-    pipeline with 2 Hz OCR and anti-spam; support manual select.
-    Methods: VideoCapture opened at start; per-mode branching.
-    Creates: cap, HUD, throttling timestamps.
+    Purpose: Run video, candidate detection, OCR, and fine tuning.
+    Methods: Read camera frames, process modes, draw both windows, and
+             dispatch keyboard and GPIO actions without blocking video.
+    Creates: Camera capture, visualization frames, and GUI windows.
     """
     global next_read_ts, scan_mode, show_zones
-    print("Press 'e' ENTER-only, 'x' EXIT-only, 's' snapshot, "
-          "'z' toggle zones, 'a' manual spot, '['/']' area range, 'q' quit.")
-    print("GPIO4=Exit(blue v), GPIO14=Enter(red ^); both -> EXIT prioritized.")
-    cv2.namedWindow("Gate Watcher")
-    cv2.setMouseCallback("Gate Watcher", on_mouse)
+    global area_min, area_max, fine_tune_last_print
+
+    print(
+        "Press 'e' ENTER, 'x' EXIT, 'd' fine-tune, 's' snapshot, "
+        "'z' zones, 'a' manual spot, '['/']' area, 'q' quit."
+    )
+    cv2.namedWindow(MAIN_WINDOW)
     cap = cv2.VideoCapture(CAMERA_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_RESOLUTION[0])
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_RESOLUTION[0])
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_RESOLUTION[1])
     if not cap.isOpened():
         print("ERROR: Cannot open USB camera!")
         GPIO.cleanup()
         return
+
+    cv2.setMouseCallback(MAIN_WINDOW, on_mouse, None)
     next_read_ts = 0.0
     last_spot_ts['enter'] = time.monotonic()
-    last_spot_ts['exit']  = time.monotonic()
+    last_spot_ts['exit'] = time.monotonic()
     brightness = BRIGHTNESS
-    contrast   = CONTRAST
-    global area_min, area_max
+    contrast = CONTRAST
+
     try:
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
                 time.sleep(0.02)
                 continue
-            enter_high, exit_high = read_gpio_state()
-            if exit_high:
-                toggle_mode('exit')
-            elif enter_high:
-                toggle_mode('enter')
-            if scan_mode == 'idle':
-                vis = frame.copy()
-                hud = "MODE: IDLE"
-                color = (200, 200, 200)
-                cv2.putText(
-                    vis, hud, (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA
-                )
-                cv2.imshow("Gate Watcher", vis)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("Exiting")
-                    break
-                elif key == ord('s'):
-                    name = datetime.now().strftime("gate_%Y%m%d_%H%M%S.jpg")
-                    cv2.imwrite(name, vis)
-                    print(f"Frame saved into {name}")
-                elif key == ord('e'):
-                    toggle_mode('enter')
-                elif key == ord('x'):
-                    toggle_mode('exit')
-                elif key == ord('z'):
-                    show_zones = not show_zones
-                    print(f"Zone overlay: {'ON' if show_zones else 'OFF'}")
-                elif key == ord(','):
-                    brightness -= 5
-                    brightness = set_brightness(brightness)
-                elif key == ord('.'):
-                    brightness += 5
-                    brightness = set_brightness(brightness)
-                elif key == ord(';'):
-                    contrast -= 5
-                    contrast = set_contrast(contrast)
-                elif key == ord("'"):
-                    contrast += 5
-                    contrast = set_contrast(contrast)
-                elif key == ord('['):
-                    area_min = max(AREA_ABS_MIN, area_min - AREA_STEP)
-                    area_max = max(area_min, area_max - AREA_STEP)
-                    print(f"Area range: {area_min}–{area_max}")
-                elif key == ord(']'):
-                    area_min = min(AREA_ABS_MAX, area_min + AREA_STEP)
-                    area_max = min(AREA_ABS_MAX, max(area_min, area_max + AREA_STEP))
-                    print(f"Area range: {area_min}–{area_max}")
-                elif key == ord('a'):
-                    boxes = find_plate_candidates(frame)
-                    manual_select_and_process(frame, boxes)
-                continue
-            boxes = find_plate_candidates(frame)
-            best_left, best_right = pick_best_by_side(boxes, frame.shape[1])
-            best_exit  = best_right if EXIT_ON_RIGHT else best_left
-            best_enter = best_left  if EXIT_ON_RIGHT else best_right
+
+            cv2.setMouseCallback(MAIN_WINDOW, on_mouse, frame)
             now = time.monotonic()
-            if AUTO_IDLE_ENABLED:
-                if scan_mode == 'enter':
-                    if best_enter:
-                        last_spot_ts['enter'] = now
-                    elif (now - last_spot_ts['enter']) >= MAX_TIME_TO_IDLE:
-                        print(f"Auto-IDLE: no ENTER spots for {MAX_TIME_TO_IDLE:.1f}s")
-                        toggle_mode('enter')
-                elif scan_mode == 'exit':
-                    if best_exit:
-                        last_spot_ts['exit'] = now
-                    elif (now - last_spot_ts['exit']) >= MAX_TIME_TO_IDLE:
-                        print(f"Auto-IDLE: no EXIT spots for {MAX_TIME_TO_IDLE:.1f}s")
-                        toggle_mode('exit')
-            if now >= next_read_ts:
-                next_read_ts = now + READ_PERIOD
-                if scan_mode == 'exit' and best_exit:
-                    p, conf, x_left, x_center = ocr_bbox(
-                        frame, best_exit, side_hint='exit'
-                    )
-                    if p:
-                        update_streak(aggr_left, p, x_center)
-                        add_sample(aggr_left, p, conf, x_center)
-                        maybe_finalize(aggr_left, frame.shape[1])
-                if scan_mode == 'enter' and best_enter:
-                    p, conf, x_left, x_center = ocr_bbox(
-                        frame, best_enter, side_hint='enter'
-                    )
-                    if p:
-                        update_streak(aggr_right, p, x_center)
-                        add_sample(aggr_right, p, conf, x_center)
-                        maybe_finalize(aggr_right, frame.shape[1])
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('a'):
-                manual_select_and_process(frame, boxes)
+
+            if not fine_tune_active:
+                enter_high, exit_high = read_gpio_state()
+                if exit_high:
+                    toggle_mode('exit')
+                elif enter_high:
+                    toggle_mode('enter')
+
+            boxes = find_plate_candidates(frame)
+            best_left, best_right = pick_best_by_side(
+                boxes,
+                frame.shape[1],
+            )
+            best_exit = best_right if EXIT_ON_RIGHT else best_left
+            best_enter = best_left if EXIT_ON_RIGHT else best_right
+
+            if not fine_tune_active and scan_mode != 'idle':
+                if AUTO_IDLE_ENABLED:
+                    if scan_mode == 'enter':
+                        if best_enter:
+                            last_spot_ts['enter'] = now
+                        elif (
+                            now - last_spot_ts['enter']
+                        ) >= MAX_TIME_TO_IDLE:
+                            print(
+                                "Auto-IDLE: no ENTER spots for "
+                                f"{MAX_TIME_TO_IDLE:.1f}s"
+                            )
+                            toggle_mode('enter')
+                    elif scan_mode == 'exit':
+                        if best_exit:
+                            last_spot_ts['exit'] = now
+                        elif (
+                            now - last_spot_ts['exit']
+                        ) >= MAX_TIME_TO_IDLE:
+                            print(
+                                "Auto-IDLE: no EXIT spots for "
+                                f"{MAX_TIME_TO_IDLE:.1f}s"
+                            )
+                            toggle_mode('exit')
+
+                if now >= next_read_ts:
+                    next_read_ts = now + READ_PERIOD
+                    if scan_mode == 'exit' and best_exit:
+                        p, conf, _, x_center = ocr_bbox(
+                            frame,
+                            best_exit,
+                            side_hint='exit',
+                        )
+                        if p:
+                            update_streak(aggr_left, p, x_center)
+                            add_sample(aggr_left, p, conf, x_center)
+                            maybe_finalize(aggr_left, frame.shape[1])
+                    if scan_mode == 'enter' and best_enter:
+                        p, conf, _, x_center = ocr_bbox(
+                            frame,
+                            best_enter,
+                            side_hint='enter',
+                        )
+                        if p:
+                            update_streak(aggr_right, p, x_center)
+                            add_sample(aggr_right, p, conf, x_center)
+                            maybe_finalize(aggr_right, frame.shape[1])
+
             vis = frame.copy()
             if show_zones:
                 draw_zones(vis)
-            for (x, y, w, h) in boxes:
-                draw_box_with_area(vis, (x, y, w, h))
-            hud = "MODE: "
-            if scan_mode == 'enter':
-                hud += "ENTER (Right)" if not EXIT_ON_RIGHT else "ENTER (Left)"
-                color = (0, 255, 0)
+            for box in boxes:
+                draw_box_with_area(vis, box)
+
+            if fine_tune_active:
+                draw_fine_tune_hud(vis, boxes)
+                show_fine_tune_masks(frame)
+                if now - fine_tune_last_print >= FINE_TUNE_PRINT_PERIOD:
+                    fine_tune_last_print = now
+                    print(
+                        f"[fine-tune] candidates={len(boxes)} "
+                        f"dark={DARK_THRESHOLD} light={LIGHT_THRESHOLD}"
+                    )
+                    print(
+                        f"[fine-tune] area={area_min}..{area_max} "
+                        f"aspect={ASPECT_MIN:.3f}..{ASPECT_MAX:.3f} "
+                        f"boxes={boxes}"
+                    )
             else:
-                hud += "EXIT (Left)" if not EXIT_ON_RIGHT else "EXIT (Right)"
-                color = (0, 255, 255)
-            cv2.putText(
-                vis, hud, (10, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA
-            )
-            cv2.imshow("Gate Watcher", vis)
+                hud = "MODE: "
+                if scan_mode == 'idle':
+                    hud += "IDLE"
+                    color = (200, 200, 200)
+                elif scan_mode == 'enter':
+                    hud += (
+                        "ENTER (Right)" if not EXIT_ON_RIGHT
+                        else "ENTER (Left)"
+                    )
+                    color = (0, 255, 0)
+                else:
+                    hud += (
+                        "EXIT (Left)" if not EXIT_ON_RIGHT
+                        else "EXIT (Right)"
+                    )
+                    color = (0, 255, 255)
+                cv2.putText(
+                    vis,
+                    hud,
+                    (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+
+            cv2.imshow(MAIN_WINDOW, vis)
+            key = cv2.waitKey(1) & 0xFF
+
+            if not main_keyboard_active:
+                key = 255
+
+            if key in (ord('d'), ord('D')):
+                toggle_fine_tune()
+                continue
+            if fine_tune_active and process_fine_tune_key(key):
+                continue
             if key == ord('q'):
                 print("Exiting")
                 break
-            elif key == ord('s'):
+            if fine_tune_active:
+                continue
+            if key == ord('s'):
                 name = datetime.now().strftime("gate_%Y%m%d_%H%M%S.jpg")
                 cv2.imwrite(name, vis)
                 print(f"Frame saved into {name}")
@@ -1068,31 +1562,34 @@ def main():
             elif key == ord('z'):
                 show_zones = not show_zones
                 print(f"Zone overlay: {'ON' if show_zones else 'OFF'}")
+            elif key == ord('a'):
+                manual_select_and_process(frame, boxes)
             elif key == ord('['):
                 area_min = max(AREA_ABS_MIN, area_min - AREA_STEP)
                 area_max = max(area_min, area_max - AREA_STEP)
-                print(f"Area range: {area_min}–{area_max}")
+                print(f"Area range: {area_min}-{area_max}")
             elif key == ord(']'):
                 area_min = min(AREA_ABS_MAX, area_min + AREA_STEP)
-                area_max = min(AREA_ABS_MAX, max(area_min, area_max + AREA_STEP))
-                print(f"Area range: {area_min}–{area_max}")
+                area_max = min(
+                    AREA_ABS_MAX,
+                    max(area_min, area_max + AREA_STEP),
+                )
+                print(f"Area range: {area_min}-{area_max}")
             elif key == ord(','):
-                brightness -= 5
-                brightness = set_brightness(brightness)
+                brightness = set_brightness(brightness - 5)
             elif key == ord('.'):
-                brightness += 5
-                brightness = set_brightness(brightness)
+                brightness = set_brightness(brightness + 5)
             elif key == ord(';'):
-                contrast -= 5
-                contrast = set_contrast(contrast)
+                contrast = set_contrast(contrast - 5)
             elif key == ord("'"):
-                contrast += 5
-                contrast = set_contrast(contrast)
+                contrast = set_contrast(contrast + 5)
     except KeyboardInterrupt:
         print("\nInterrupted by Ctrl+C. Exiting...")
     finally:
         cap.release()
         cv2.destroyAllWindows()
         GPIO.cleanup()
+
+
 if __name__ == "__main__":
     main()
