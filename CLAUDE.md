@@ -40,13 +40,13 @@ cd spot-watcher/src && uv run main.py --dry-run  # print bay scores, no server
 The web-server / gate-watcher `README.md` files say `uv run main`; the real entrypoint is
 `main.py` in every sub-project.
 
-spot-watcher is two scripts, both headless (no GUI — you inspect JPGs written to disk):
-- `uv run cal.py` — on first run auto-detects bays from bright vertical lane markers and fits the
-  fixed 6/4/6 layout (`auto_detect`; falls back to an even grid, re-runnable with the `auto`
-  command, debug overlay in `cal_auto_debug.jpg`). Interactive prompt then adjusts the 16 boxes
-  (`spots.json`) and, with the lot empty, `save` captures reference crops (`refs/00.png`..`15.png`).
-  Writes `cal_preview.jpg` after every change. Rows map to ids: `row0`→0-5, `row1`→6-9, `row2`→10-15.
-  `main.py` exits if `spots.json` or `refs/` is missing.
+spot-watcher is two scripts:
+- `uv run cal.py` — a **Flask web app on port 8000** (the Pi is headless; you drive it from a
+  laptop browser at `http://<pi-ip>:8000/`). Live camera view with 16 draggable/resizable boxes;
+  buttons: Auto-detect (`auto_detect` — fits the fixed 6/4/6 layout to bright vertical lane
+  markers), Reset grid, Save layout (writes `spots.json`), Capture empty references (writes
+  `refs/00.png`..`15.png` from an empty-lot frame). Boxes are ordered top row 0-5, middle 6-9,
+  bottom 10-15. `main.py` exits if `spots.json` or `refs/` is missing.
 - `uv run main.py` — every `INTERVAL_SEC`, crop each bay, score it against its reference, POST all
   16 to `/update_spots`. `--dry-run` prints per-bay scores and writes `dryrun_preview.jpg` instead
   of contacting the server — use it to tune `DIFF_THRESHOLD`.
@@ -63,7 +63,8 @@ script and must be edited by hand when hardware or the network changes:
   `EXIT_ON_RIGHT` (which half of the frame is the exit lane), OCR/area thresholds.
 - `spot-watcher/src/main.py`: `SERVER_URL` (web server, `/update_spots` is appended), `CAMERA_INDEX`,
   `RESOLUTION`, `INTERVAL_SEC`, `DIFF_THRESHOLD` / `PIXEL_DELTA` / `BRIGHT_TOLERANCE` (occupancy
-  tuning). `CAMERA_INDEX` / `RESOLUTION` are repeated in `cal.py` — keep them in sync.
+  tuning). `CAMERA_INDEX` / `RESOLUTION` are repeated in `cal.py` (which also has `PORT`, default
+  8000, and the `MARKER_*` auto-detect filters) — keep the camera settings in sync.
 
 These addresses are frequently out of sync with each other — check them before assuming a
 connectivity bug is in the code.
@@ -102,8 +103,8 @@ exit while `paidToTime > now`. `/enter` grants `entryGracePeriod` (10 s) free; `
 - `app.run(...)` is called at module top level in `main.py`, so importing it starts the server.
 - gate-watcher imports Raspberry-Pi-only libraries (`RPi.GPIO` via `rpi-lgpio`) and opens an OpenCV
   GUI window — it only runs meaningfully on the target Pi with hardware attached, not on a dev
-  laptop. spot-watcher uses `opencv-python-headless` and never opens a window (it writes JPGs), but
-  still needs a real camera.
+  laptop. spot-watcher uses `opencv-python-headless` and never opens a window: `main.py` writes
+  JPGs, `cal.py` serves a browser UI. Both still need a real camera.
 - gate-watcher's OpenCV window is the operator UI: `e`/`x` toggle enter/exit-only scanning, `a`
   processes the bbox nearest the mouse, `[` / `]` adjust the detection area filter, and there is a
   "fine tune" trackbar mode for the plate-detection masks. The long changelog docstring at the top

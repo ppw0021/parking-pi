@@ -1,52 +1,43 @@
 #!/usr/bin/env python3
 """
-cal.py - calibrate the 16 parking-bay boxes for a headless (SSH) Pi.
+cal.py - browser-based calibration for the 16 parking bays.
 
-The lot is always 6 bays in the top row, 4 in the middle, 6 in the bottom
-(spot ids 0-5, 6-9, 10-15 - the order the web server expects).
+The spot-watcher Pi is headless, so calibration runs as a small web app:
 
-A box is four pixel numbers: x, y, w, h. There is no GUI: you look at
-`cal_preview.jpg`, adjust numbers, and look again.
+    uv run cal.py
+    # then open  http://<pi-ip>:8000/  from a laptop on the same network
 
-Workflow
---------
-1.  uv run cal.py
-    First run tries to auto-detect the bays from the bright lane markers and
-    fit the 6/4/6 layout; if that fails it falls back to an even grid. Either
-    way it writes spots.json and cal_preview.jpg (plus cal_auto_debug.jpg
-    showing the detected markers).
-2.  Open cal_preview.jpg (VS Code Remote, scp, shared folder) and compare
-    the numbered boxes against the real bays.
-3.  At the `cal>` prompt, adjust until every box sits on its bay:
-      auto                     re-run marker auto-detection
-      <id> <x> <y> <w> <h>     move one box            e.g.  5 120 340 90 160
-      row<0|1|2> <x> <y> <w> <h>   set a row's outer rectangle, split evenly
-      mv <id> <dx> <dy>        nudge one box
-      grid                     reset to the default 6/4/6 grid
-      show                     print the current boxes
-      shot                     just re-grab the frame and redraw the preview
-      save                     capture the empty-lot reference crops (refs/)
-      q                        quit
-    Every change rewrites spots.json and cal_preview.jpg.
-4.  With the lot empty and the boxes aligned, run `save`. It fills
-    refs/00.png .. 15.png and writes cal_preview_refs.jpg to check.
+In the browser you get the live camera view with 16 boxes on top (6 top row,
+4 middle, 6 bottom - spot ids 0-5, 6-9, 10-15, the order the web server
+expects). Drag a box to move it, drag its corner to resize, click to select,
+arrow keys nudge. Buttons:
+
+  Refresh view              re-grab the camera frame
+  Auto-detect               fit the 6/4/6 layout to the bright lane markers
+  Reset grid                drop back to an even grid
+  Save layout               write spots.json
+  Capture empty references  (lot must be empty) write refs/00.png .. 15.png
+
+main.py then reads spots.json + refs/.
 """
+import io
 import json
 import os
 import statistics
-import sys
+import threading
 
 import cv2
 import numpy as np
+from flask import Flask, Response, jsonify, request, send_file
 
 # ---------------- Configuration ----------------
 CAMERA_INDEX = 0
 RESOLUTION = (1920, 1080)          # (width, height) requested from the camera
+HOST, PORT = "0.0.0.0", 8000
 SPOTS_PATH = "spots.json"
 REFS_DIR = "refs"
 PREVIEW_PATH = "cal_preview.jpg"
 REFS_PREVIEW_PATH = "cal_preview_refs.jpg"
-AUTO_DEBUG_PATH = "cal_auto_debug.jpg"
 REF_SIZE = (128, 128)             # every reference crop is stored at this size
 
 # (first spot id, number of spots) for the top, middle and bottom rows
@@ -59,42 +50,45 @@ MARKER_MAX_W_FRAC = 0.05          # max marker width, fraction of frame width
 MARKER_MIN_ASPECT = 2.0          # min height / width of a marker blob
 # ----------------------------------------------
 
-
-def open_camera():
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        sys.exit(f"Could not open camera {CAMERA_INDEX}")
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUTION[0])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
+_cam_lock = threading.Lock()
+_cap = None
 
 
-def grab_frame(cap):
-    """Median of a few fresh frames - kills sensor noise in the references."""
-    frames = []
-    for _ in range(7):
-        ok, frame = cap.read()
-        if ok and frame is not None:
-            frames.append(frame)
-    if not frames:
-        sys.exit("Camera returned no frames")
-    return np.median(np.stack(frames[-5:]), axis=0).astype(np.uint8)
+def _camera():
+    global _cap
+    if _cap is None or not _cap.isOpened():
+        _cap = cv2.VideoCapture(CAMERA_INDEX)
+        _cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        _cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUTION[0])
+        _cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
+        _cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if not _cap.isOpened():
+        raise RuntimeError(f"could not open camera {CAMERA_INDEX}")
+    return _cap
 
 
-def default_grid(width, height):
-    """A first guess: 6/4/6 boxes spread across the frame."""
-    # (y0, y1) band and (x0, x1) span for each row, as fractions of the frame
-    bands = [(0.12, 0.36, 0.05, 0.95),
-             (0.42, 0.58, 0.20, 0.80),
-             (0.64, 0.88, 0.05, 0.95)]
-    spots = {}
-    for (start_id, count), (y0, y1, x0, x1) in zip(ROWS, bands):
-        row_x, row_y = x0 * width, y0 * height
-        row_w, row_h = (x1 - x0) * width, (y1 - y0) * height
-        spots.update(split_row(start_id, count, row_x, row_y, row_w, row_h))
-    return spots
+def grab_frame():
+    """Newest available frame, with a few throwaways to clear the buffer."""
+    with _cam_lock:
+        cap = _camera()
+        frame = None
+        for _ in range(6):
+            ok, f = cap.read()
+            if ok and f is not None:
+                frame = f
+        if frame is None:
+            raise RuntimeError("camera returned no frames")
+        return frame
+
+
+# ---------------- Geometry helpers ----------------
+def clamp_box(box, width, height):
+    x, y, w, h = box
+    x = max(0, min(int(x), width - 1))
+    y = max(0, min(int(y), height - 1))
+    w = max(1, min(int(w), width - x))
+    h = max(1, min(int(h), height - y))
+    return [x, y, w, h]
 
 
 def split_row(start_id, count, x, y, w, h, gap_frac=0.15):
@@ -112,6 +106,19 @@ def split_row(start_id, count, x, y, w, h, gap_frac=0.15):
     return boxes
 
 
+def default_grid(width, height):
+    """An even 6/4/6 grid spread across the frame."""
+    bands = [(0.12, 0.36, 0.05, 0.95),
+             (0.42, 0.58, 0.20, 0.80),
+             (0.64, 0.88, 0.05, 0.95)]
+    spots = {}
+    for (start_id, count), (y0, y1, x0, x1) in zip(ROWS, bands):
+        spots.update(split_row(start_id, count, x0 * width, y0 * height,
+                               (x1 - x0) * width, (y1 - y0) * height))
+    return spots
+
+
+# ---------------- Auto detection ----------------
 def find_markers(frame):
     """Bright, tall-thin vertical blobs -> list of (x, y, w, h) bounding rects."""
     h_img, w_img = frame.shape[:2]
@@ -154,9 +161,9 @@ def group_rows(markers):
 def auto_detect(frame):
     """Detect lane markers and fit the 6/4/6 layout.
 
-    Returns (spots_dict_or_None, markers). When markers line up as exactly
-    `count + 1` per row the bay edges are taken from them; otherwise the row
-    is split evenly between its outermost markers.
+    Returns (spots_dict_or_None, markers). When a row shows exactly `count + 1`
+    markers the bay edges come from them; otherwise the row is split evenly
+    between its outermost markers.
     """
     h_img, w_img = frame.shape[:2]
     markers = find_markers(frame)
@@ -190,57 +197,18 @@ def auto_detect(frame):
     return spots, markers
 
 
-def draw_auto_debug(frame, markers, spots):
-    vis = frame.copy()
-    for x, y, w, h in markers:
-        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
-    for i in range(16):
-        box = spots.get(str(i))
-        if box:
-            x, y, w, h = box
-            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
-    cv2.imwrite(AUTO_DEBUG_PATH, vis)
-
-
-def try_auto(frame):
-    """Run auto_detect, write the debug image, print a summary. Returns spots or None."""
-    spots, markers = auto_detect(frame)
-    draw_auto_debug(frame, markers, spots or {})
-    if spots:
-        print(f"auto-detect: {len(markers)} markers -> 16 boxes "
-              f"(check {AUTO_DEBUG_PATH})")
-    else:
-        print(f"auto-detect failed: {len(markers)} markers, need 3 rows of >=2 "
-              f"(check {AUTO_DEBUG_PATH}); tune MARKER_* in cal.py")
-    return spots
-
-
-def row_for_id(spot_id):
-    for start_id, count in ROWS:
-        if start_id <= spot_id < start_id + count:
-            return start_id, count
-    return None
-
-
-def load_spots():
+# ---------------- Persistence ----------------
+def read_spots():
+    if not os.path.exists(SPOTS_PATH):
+        return None
     with open(SPOTS_PATH) as f:
-        data = json.load(f)
-    return data.get("spots", {})
+        return json.load(f)
 
 
-def save_spots(spots):
+def write_spots(spots):
     ordered = {str(i): spots[str(i)] for i in range(16) if str(i) in spots}
     with open(SPOTS_PATH, "w") as f:
         json.dump({"resolution": list(RESOLUTION), "spots": ordered}, f, indent=2)
-
-
-def clamp_box(box, width, height):
-    x, y, w, h = box
-    x = max(0, min(int(x), width - 1))
-    y = max(0, min(int(y), height - 1))
-    w = max(1, min(int(w), width - x))
-    h = max(1, min(int(h), height - y))
-    return [x, y, w, h]
 
 
 def draw_preview(frame, spots, path):
@@ -254,119 +222,284 @@ def draw_preview(frame, spots, path):
         cv2.putText(vis, str(i), (x + 4, y + 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     cv2.imwrite(path, vis)
-    print(f"wrote {path}")
 
 
 def capture_refs(frame, spots):
-    os.makedirs(REFS_DIR, exist_ok=True)
-    missing = [str(i) for i in range(16) if str(i) not in spots]
+    """Crop every bay from `frame` into refs/. Returns (ok, missing_ids)."""
+    missing = [i for i in range(16) if str(i) not in spots]
     if missing:
-        print(f"refusing to save: boxes {', '.join(missing)} are not set")
-        return
+        return False, missing
+    os.makedirs(REFS_DIR, exist_ok=True)
+    h_img, w_img = frame.shape[:2]
     tiles = []
     for i in range(16):
-        x, y, w, h = spots[str(i)]
-        crop = frame[y:y + h, x:x + w]
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        x, y, w, h = clamp_box(spots[str(i)], w_img, h_img)
+        gray = cv2.cvtColor(frame[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY)
         gray = cv2.resize(gray, REF_SIZE, interpolation=cv2.INTER_AREA)
         cv2.imwrite(os.path.join(REFS_DIR, f"{i:02d}.png"), gray)
         tile = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         cv2.putText(tile, str(i), (4, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         tiles.append(tile)
-    grid = np.vstack([np.hstack(tiles[r:r + 8]) for r in (0, 8)])
-    cv2.imwrite(REFS_PREVIEW_PATH, grid)
-    print(f"saved 16 references to {REFS_DIR}/ and wrote {REFS_PREVIEW_PATH}")
+    montage = np.vstack([np.hstack(tiles[r:r + 8]) for r in (0, 8)])
+    cv2.imwrite(REFS_PREVIEW_PATH, montage)
+    return True, []
 
 
-def handle(cmd, spots, frame):
-    """Mutate `spots` in place. Return True if the frame should be re-grabbed."""
-    parts = cmd.split()
-    if not parts:
-        return False
-    head, args = parts[0], parts[1:]
-    h_img, w_img = frame.shape[:2]
-
-    if head == "auto":
-        found = try_auto(frame)
-        if found:
-            spots.clear()
-            spots.update(found)
-    elif head == "grid":
-        spots.clear()
-        spots.update(default_grid(w_img, h_img))
-    elif head == "show":
-        for i in range(16):
-            print(f"  {i:2d}: {spots.get(str(i))}")
-    elif head == "shot":
-        return True
-    elif head == "mv" and len(args) == 3:
-        i, dx, dy = args
-        box = spots.get(i)
-        if box:
-            box[0] += int(dx)
-            box[1] += int(dy)
-            spots[i] = clamp_box(box, w_img, h_img)
-    elif head.startswith("row") and len(args) == 4:
-        try:
-            row_idx = int(head[3:])
-            start_id, count = ROWS[row_idx]
-        except (ValueError, IndexError):
-            print("row index must be 0, 1 or 2")
-            return False
-        x, y, w, h = (float(a) for a in args)
-        spots.update({k: clamp_box(v, w_img, h_img)
-                      for k, v in split_row(start_id, count, x, y, w, h).items()})
-    elif head.isdigit() and len(args) == 4:
-        i = int(head)
-        if 0 <= i <= 15:
-            spots[str(i)] = clamp_box([float(a) for a in args], w_img, h_img)
-        else:
-            print("spot id must be 0-15")
-    else:
-        print("commands: auto | <id> x y w h | row<0-2> x y w h | mv <id> dx dy "
-              "| grid | show | shot | save | q")
-    return False
+def clean_spots(raw):
+    out = {}
+    for i in range(16):
+        b = raw.get(str(i), raw.get(i))
+        if isinstance(b, (list, tuple)) and len(b) == 4:
+            out[str(i)] = [int(round(float(v))) for v in b]
+    return out
 
 
-def main():
-    cap = open_camera()
-    frame = grab_frame(cap)
-    h_img, w_img = frame.shape[:2]
-    print(f"camera frame is {w_img}x{h_img}")
+# ---------------- Web app ----------------
+app = Flask(__name__)
 
-    if os.path.exists(SPOTS_PATH):
-        spots = load_spots()
-        print(f"loaded {len(spots)} boxes from {SPOTS_PATH}")
-    else:
-        spots = try_auto(frame)
-        if not spots:
-            spots = default_grid(w_img, h_img)
-            print(f"seeded {SPOTS_PATH} with a default 6/4/6 grid")
-        save_spots(spots)
 
+@app.get("/")
+def index():
+    return Response(PAGE, mimetype="text/html")
+
+
+@app.get("/frame.jpg")
+def frame_jpg():
+    try:
+        frame = grab_frame()
+    except RuntimeError as e:
+        return jsonify(error=str(e)), 503
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    resp = send_file(io.BytesIO(buf.tobytes()), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/api/spots")
+def api_spots_get():
+    saved = read_spots()
+    if saved:
+        return jsonify(native=saved.get("resolution", list(RESOLUTION)),
+                       spots=saved.get("spots", {}), source="spots.json")
+    w, h = RESOLUTION
+    spots, source = None, "default grid"
+    try:
+        frame = grab_frame()
+        h, w = frame.shape[:2]
+        spots, _ = auto_detect(frame)
+        source = "auto-detect"
+    except RuntimeError:
+        pass
+    return jsonify(native=[w, h], spots=spots or default_grid(w, h),
+                   source=source if spots else "default grid")
+
+
+@app.post("/api/spots")
+def api_spots_post():
+    spots = clean_spots(request.get_json(force=True).get("spots", {}))
+    if len(spots) != 16:
+        return jsonify(ok=False, error="need all 16 boxes"), 400
+    write_spots(spots)
+    try:
+        draw_preview(grab_frame(), spots, PREVIEW_PATH)
+    except RuntimeError:
+        pass
+    return jsonify(ok=True)
+
+
+@app.get("/api/grid")
+def api_grid():
+    w, h = RESOLUTION
+    try:
+        f = grab_frame()
+        h, w = f.shape[:2]
+    except RuntimeError:
+        pass
+    return jsonify(spots=default_grid(w, h))
+
+
+@app.post("/api/auto")
+def api_auto():
+    try:
+        frame = grab_frame()
+    except RuntimeError as e:
+        return jsonify(ok=False, error=str(e), markers=0), 503
+    spots, markers = auto_detect(frame)
+    return jsonify(ok=bool(spots), spots=spots or {}, markers=len(markers))
+
+
+@app.post("/api/references")
+def api_references():
+    spots = clean_spots(request.get_json(force=True).get("spots", {}))
+    if len(spots) != 16:
+        return jsonify(ok=False, error="need all 16 boxes"), 400
+    write_spots(spots)
+    try:
+        frame = grab_frame()
+    except RuntimeError as e:
+        return jsonify(ok=False, error=str(e)), 503
+    ok, missing = capture_refs(frame, spots)
+    if not ok:
+        return jsonify(ok=False, missing=missing), 400
     draw_preview(frame, spots, PREVIEW_PATH)
-    print(__doc__.split("Workflow")[0].strip())
+    return jsonify(ok=True)
 
-    while True:
-        try:
-            cmd = input("cal> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if cmd in ("q", "quit", "exit"):
-            break
-        if cmd == "save":
-            capture_refs(frame, spots)
-            continue
-        regrab = handle(cmd, spots, frame)
-        if regrab:
-            frame = grab_frame(cap)
-        save_spots(spots)
-        draw_preview(frame, spots, PREVIEW_PATH)
 
-    cap.release()
+PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<title>Spot calibration</title><style>
+body{font:14px system-ui,sans-serif;margin:0;background:#1e1e1e;color:#ddd}
+header{padding:8px 12px;background:#252526;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button{padding:6px 10px;background:#0e639c;color:#fff;border:0;border-radius:4px;cursor:pointer}
+button.alt{background:#3a3d41}
+#wrap{padding:12px}
+#stage{position:relative;overflow:hidden;border:1px solid #444;user-select:none}
+#frame{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.box{position:absolute;border:2px solid #35d07f;background:rgba(53,208,127,.12);box-sizing:border-box}
+.box.sel{border-color:#f5d90a;background:rgba(245,217,10,.15);z-index:5}
+.box .lbl{position:absolute;left:0;top:0;background:#000a;color:#fff;font-size:12px;padding:0 4px}
+.box .hnd{position:absolute;right:-6px;bottom:-6px;width:12px;height:12px;background:#f5d90a;border:1px solid #000;cursor:nwse-resize}
+#readout{padding:6px 0;font-family:monospace;min-height:1.4em}
+#readout input{width:5em;background:#3c3c3c;color:#eee;border:1px solid #555;border-radius:3px}
+#hint{color:#888}
+#toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#333;padding:8px 14px;border-radius:4px;opacity:0;transition:.2s;pointer-events:none}
+#toast.show{opacity:1}
+</style></head><body>
+<header>
+  <strong>Spot calibration</strong>
+  <button id="btn-refresh" class="alt">Refresh view</button>
+  <label><input type="checkbox" id="chk-auto"> auto&nbsp;2s</label>
+  <button id="btn-auto">Auto-detect</button>
+  <button id="btn-grid" class="alt">Reset grid</button>
+  <span style="flex:1"></span>
+  <button id="btn-save">Save layout</button>
+  <button id="btn-refs">Capture empty references</button>
+</header>
+<div id="wrap">
+  <div id="readout">loading&hellip;</div>
+  <div id="stage"><img id="frame" alt=""></div>
+  <p id="hint">Drag a box to move, drag the yellow corner to resize, click to select,
+     arrow keys nudge (Shift = &times;10). "Save layout" writes spots.json.
+     "Capture empty references" must be done with the lot empty.</p>
+</div>
+<div id="toast"></div>
+<script>
+const stage=document.getElementById('stage'), frameImg=document.getElementById('frame');
+let NATIVE=[1920,1080], SCALE=1, boxes=[], els=[], selected=-1, drag=null, autoTimer=null;
+
+const toDisp=b=>({x:b[0]/SCALE,y:b[1]/SCALE,w:b[2]/SCALE,h:b[3]/SCALE});
+function toNative(){const o={};boxes.forEach((b,i)=>o[i]=[Math.round(b.x*SCALE),Math.round(b.y*SCALE),Math.round(b.w*SCALE),Math.round(b.h*SCALE)]);return o;}
+function seq(obj){const a=[];for(let i=0;i<16;i++){const b=obj[i]||obj[String(i)];if(b)a.push(toDisp(b));}return a;}
+
+function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');
+  clearTimeout(toast._t);toast._t=setTimeout(()=>t.classList.remove('show'),3000);}
+
+function refreshView(){frameImg.src='/frame.jpg?ts='+Date.now();}
+
+function clampBox(b){
+  const W=stage.clientWidth, H=stage.clientHeight;
+  b.w=Math.max(8,Math.min(b.w,W)); b.h=Math.max(8,Math.min(b.h,H));
+  b.x=Math.max(0,Math.min(b.x,W-b.w)); b.y=Math.max(0,Math.min(b.y,H-b.h));
+}
+function place(i){const e=els[i],b=boxes[i];if(!e)return;
+  e.style.left=b.x+'px';e.style.top=b.y+'px';e.style.width=b.w+'px';e.style.height=b.h+'px';
+  e.classList.toggle('sel',i===selected);}
+
+function render(){
+  els.forEach(e=>e.remove()); els=[];
+  boxes.forEach((b,i)=>{
+    const e=document.createElement('div'); e.className='box';
+    e.innerHTML='<span class="lbl">'+i+'</span><span class="hnd"></span>';
+    e.addEventListener('mousedown',ev=>startDrag(ev,i));
+    stage.appendChild(e); els[i]=e; place(i);
+  });
+  updateReadout();
+}
+
+function startDrag(ev,i){
+  ev.preventDefault(); ev.stopPropagation();
+  selected=i;
+  drag={i,resize:ev.target.classList.contains('hnd'),mx:ev.clientX,my:ev.clientY,
+        ox:boxes[i].x,oy:boxes[i].y,ow:boxes[i].w,oh:boxes[i].h};
+  els.forEach((_,j)=>place(j));
+  updateReadout();
+}
+document.addEventListener('mousemove',ev=>{
+  if(!drag)return;
+  const dx=ev.clientX-drag.mx, dy=ev.clientY-drag.my, b=boxes[drag.i];
+  if(drag.resize){b.w=drag.ow+dx;b.h=drag.oh+dy;} else {b.x=drag.ox+dx;b.y=drag.oy+dy;}
+  clampBox(b); place(drag.i); updateReadout();
+});
+document.addEventListener('mouseup',()=>{drag=null;});
+stage.addEventListener('mousedown',ev=>{if(ev.target===stage||ev.target===frameImg){selected=-1;els.forEach((_,j)=>place(j));updateReadout();}});
+
+document.addEventListener('keydown',ev=>{
+  if(selected<0||!ev.key.startsWith('Arrow'))return;
+  if(document.activeElement&&document.activeElement.tagName==='INPUT')return;
+  ev.preventDefault();
+  const s=ev.shiftKey?10:1, b=boxes[selected];
+  if(ev.key==='ArrowLeft')b.x-=s; else if(ev.key==='ArrowRight')b.x+=s;
+  else if(ev.key==='ArrowUp')b.y-=s; else if(ev.key==='ArrowDown')b.y+=s;
+  clampBox(b); place(selected); updateReadout();
+});
+
+function updateReadout(){
+  const r=document.getElementById('readout');
+  if(selected<0){r.textContent='no spot selected';return;}
+  const b=boxes[selected], n=[b.x,b.y,b.w,b.h].map(v=>Math.round(v*SCALE));
+  r.innerHTML='spot <b>'+selected+'</b> native px &nbsp;'+
+    ['x','y','w','h'].map((k,j)=>k+' <input data-k="'+j+'" value="'+n[j]+'">').join(' &nbsp;');
+  r.querySelectorAll('input').forEach(inp=>inp.addEventListener('change',()=>{
+    const j=+inp.dataset.k, v=parseFloat(inp.value)/SCALE, b=boxes[selected];
+    if(isNaN(v))return;
+    if(j===0)b.x=v; else if(j===1)b.y=v; else if(j===2)b.w=v; else b.h=v;
+    clampBox(b); place(selected); updateReadout();
+  }));
+}
+
+async function jget(u){return (await fetch(u)).json();}
+async function jpost(u,body){return (await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(body||{})})).json();}
+
+document.getElementById('btn-refresh').onclick=refreshView;
+document.getElementById('chk-auto').onchange=e=>{
+  clearInterval(autoTimer);
+  if(e.target.checked)autoTimer=setInterval(refreshView,2000);
+};
+document.getElementById('btn-auto').onclick=async()=>{
+  const r=await jpost('/api/auto');
+  if(!r.ok){toast('auto-detect failed ('+(r.markers||0)+' markers) - adjust MARKER_* in cal.py');return;}
+  boxes=seq(r.spots); selected=-1; render(); toast('auto-detected from '+r.markers+' markers');
+};
+document.getElementById('btn-grid').onclick=async()=>{
+  const r=await jget('/api/grid'); boxes=seq(r.spots); selected=-1; render(); toast('reset to even grid');
+};
+document.getElementById('btn-save').onclick=async()=>{
+  const r=await jpost('/api/spots',{spots:toNative()});
+  toast(r.ok?'saved spots.json':('save failed: '+(r.error||'')));
+};
+document.getElementById('btn-refs').onclick=async()=>{
+  if(!confirm('The lot must be EMPTY. Capture references now?'))return;
+  const r=await jpost('/api/references',{spots:toNative()});
+  if(r.ok)toast('saved 16 references + spots.json');
+  else toast('failed: '+(r.error||'')+(r.missing?(' missing '+r.missing.join(',')):''));
+};
+
+async function boot(){
+  const s=await jget('/api/spots');
+  NATIVE=s.native;
+  const dispW=Math.min(1280,NATIVE[0]);
+  SCALE=NATIVE[0]/dispW;
+  stage.style.width=(NATIVE[0]/SCALE)+'px';
+  stage.style.height=(NATIVE[1]/SCALE)+'px';
+  refreshView();
+  boxes=seq(s.spots); render();
+  toast('loaded: '+s.source);
+}
+boot();
+</script></body></html>"""
 
 
 if __name__ == "__main__":
-    main()
+    print(f"calibration UI on http://{HOST}:{PORT}/  (open it from a laptop)")
+    app.run(host=HOST, port=PORT, threaded=True)
