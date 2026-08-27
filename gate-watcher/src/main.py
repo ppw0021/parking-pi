@@ -143,9 +143,21 @@ SERVO_ENTRY_PIN  = 23  # Entry gate servo
 SERVO_EXIT_PIN   = 24  # Exit gate servo
 # Gate deay
 GATE_DELAY = 5
+# Exit bay side flag: when True, Exit is on the right side
+EXIT_ON_RIGHT = False
+# Hardware controls
+HW_CONTROL_ENABLED = False
 # Setup button pins
-GPIO.setup(ENTRY_BUTTON_PIN, GPIO.IN)
-GPIO.setup(EXIT_BUTTON_PIN,  GPIO.IN)
+GPIO.setup(
+    ENTRY_BUTTON_PIN,
+    GPIO.IN,
+    pull_up_down=GPIO.PUD_UP,
+)
+GPIO.setup(
+    EXIT_BUTTON_PIN,
+    GPIO.IN,
+    pull_up_down=GPIO.PUD_UP,
+)
 # Setup LED pins
 for pin in ENTRY_LED_PINS:
     GPIO.setup(pin, GPIO.OUT)
@@ -158,12 +170,12 @@ GPIO.setup(SERVO_EXIT_PIN,  GPIO.OUT)
 from leds import LedControl
 led = LedControl(ENTRY_LED_PINS, EXIT_LED_PINS)
 # ---------------- Configuration --------------------------------------------
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 CAMERA_DEVICE = f"/dev/video{CAMERA_INDEX}"
 # WEB_PI_IP = "http://10.138.63.88" # old location
 # WEB_PI_IP = "http://192.168.1.16"    # current location
-# WEB_PI_IP =  "http://10.130.1.206"
-WEB_PI_IP =  "http://10.0.0.2"
+WEB_PI_IP =  "http://10.130.1.228"
+# WEB_PI_IP =  "http://10.0.0.2"
 URL = f"{WEB_PI_IP}:5000"
 ASPECT_MIN = 2.0
 ASPECT_MAX = 6.0
@@ -334,16 +346,23 @@ def set_gate(gate_id: int, close: bool):
     finally:
         pwm.stop()
     print(f"Moved servo to {angle}° (duty {duty:.2f}%)")
+
 def read_gpio_state():
     """
     Function: read_gpio_state
-    Purpose: Sample button pins; HIGH means active per wiring.
-    Methods: GPIO.input() on ENTRY_BUTTON_PIN/EXIT_BUTTON_PIN.
-    Creates: two booleans (enter_high, exit_high).
+    Purpose: Read active-low entry and exit hardware buttons.
+    Methods: Read GPIO inputs configured with internal pull-up resistors.
+    Creates: Two booleans indicating whether each button is pressed.
     """
-    enter_high = (GPIO.input(ENTRY_BUTTON_PIN) == GPIO.HIGH)
-    exit_high  = (GPIO.input(EXIT_BUTTON_PIN)  == GPIO.HIGH)
-    return enter_high, exit_high
+    enter_pressed = (
+        GPIO.input(ENTRY_BUTTON_PIN) == GPIO.LOW
+    )
+    exit_pressed = (
+        GPIO.input(EXIT_BUTTON_PIN) == GPIO.LOW
+    )
+
+    return enter_pressed, exit_pressed
+
 def set_brightness(value):
     """
     Function: set_brightness
@@ -1394,10 +1413,19 @@ def main():
     global next_read_ts, scan_mode, show_zones
     global area_min, area_max, fine_tune_last_print
 
-    print(
-        "Press 'e' ENTER, 'x' EXIT, 'd' fine-tune, 's' snapshot, "
-        "'z' zones, 'a' manual spot, '['/']' area, 'q' quit."
-    )
+    if HW_CONTROL_ENABLED:
+        print(
+            "HW controls enabled: GPIO buttons select ENTER and EXIT. "
+            "Press 'd' fine-tune, 'v' zones, 's' snapshot, "
+            "'a' manual spot, or 'q' quit."
+        )
+    else:
+        print(
+            "HW controls disabled: press 'z' ENTER, 'x' EXIT, "
+            "'d' fine-tune, 'v' zones, 's' snapshot, "
+            "'a' manual spot, or 'q' quit."
+        )
+
     cv2.namedWindow(MAIN_WINDOW)
     cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_RESOLUTION[0])
@@ -1414,6 +1442,9 @@ def main():
     brightness = BRIGHTNESS
     contrast = CONTRAST
 
+    previous_enter_pressed = False
+    previous_exit_pressed = False
+
     try:
         while True:
             ok, frame = cap.read()
@@ -1424,12 +1455,16 @@ def main():
             cv2.setMouseCallback(MAIN_WINDOW, on_mouse, frame)
             now = time.monotonic()
 
-            if not fine_tune_active:
-                enter_high, exit_high = read_gpio_state()
-                if exit_high:
-                    toggle_mode('exit')
-                elif enter_high:
+            if not fine_tune_active and HW_CONTROL_ENABLED:
+                enter_pressed, exit_pressed = read_gpio_state()
+
+                if enter_pressed and not previous_enter_pressed:
                     toggle_mode('enter')
+                elif exit_pressed and not previous_exit_pressed:
+                    toggle_mode('exit')
+
+                previous_enter_pressed = enter_pressed
+                previous_exit_pressed = exit_pressed
 
             boxes = find_plate_candidates(frame)
             best_left, best_right = pick_best_by_side(
@@ -1555,13 +1590,16 @@ def main():
                 name = datetime.now().strftime("gate_%Y%m%d_%H%M%S.jpg")
                 cv2.imwrite(name, vis)
                 print(f"Frame saved into {name}")
-            elif key == ord('e'):
+            elif not HW_CONTROL_ENABLED and key == ord('z'):
                 toggle_mode('enter')
-            elif key == ord('x'):
+            elif not HW_CONTROL_ENABLED and key == ord('x'):
                 toggle_mode('exit')
-            elif key == ord('z'):
+            elif key == ord('v'):
                 show_zones = not show_zones
-                print(f"Zone overlay: {'ON' if show_zones else 'OFF'}")
+                print(
+                    f"Zone overlay: "
+                    f"{'ON' if show_zones else 'OFF'}"
+                )
             elif key == ord('a'):
                 manual_select_and_process(frame, boxes)
             elif key == ord('['):
