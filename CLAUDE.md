@@ -42,11 +42,12 @@ The web-server / gate-watcher `README.md` files say `uv run main`; the real entr
 
 spot-watcher is two scripts:
 - `uv run cal.py` — a **Flask web app on port 8000** (the Pi is headless; you drive it from a
-  laptop browser at `http://<pi-ip>:8000/`). Live camera view with 16 draggable/resizable boxes;
-  buttons: Auto-detect (`auto_detect` — fits the fixed 6/4/6 layout to bright vertical lane
-  markers), Reset grid, Save layout (writes `spots.json`), Capture empty references (writes
-  `refs/00.png`..`15.png` from an empty-lot frame). Boxes are ordered top row 0-5, middle 6-9,
-  bottom 10-15. `main.py` exits if `spots.json` or `refs/` is missing.
+  laptop browser at `http://<pi-ip>:8000/`). A row of 16 pads over the live camera view; arm a pad,
+  click two opposite corners of that bay in the image, and it auto-advances to the next unplaced
+  pad. Placed boxes are then draggable/resizable/nudgeable. Save layout → `spots.json` (partial
+  allowed); Capture empty references → `refs/00.png`..`15.png` from an empty-lot frame (needs all
+  16). Pads/ids are ordered top row 0-5, middle 6-9, bottom 10-15. `main.py` exits if `spots.json`
+  or `refs/` is missing.
 - `uv run main.py` — every `INTERVAL_SEC`, crop each bay, score it against its reference, POST all
   16 to `/update_spots`. `--dry-run` prints per-bay scores and writes `dryrun_preview.jpg` instead
   of contacting the server — use it to tune `DIFF_THRESHOLD`.
@@ -64,7 +65,7 @@ script and must be edited by hand when hardware or the network changes:
 - `spot-watcher/src/main.py`: `SERVER_URL` (web server, `/update_spots` is appended), `CAMERA_INDEX`,
   `RESOLUTION`, `INTERVAL_SEC`, `DIFF_THRESHOLD` / `PIXEL_DELTA` / `BRIGHT_TOLERANCE` (occupancy
   tuning). `CAMERA_INDEX` / `RESOLUTION` are repeated in `cal.py` (which also has `PORT`, default
-  8000, and the `MARKER_*` auto-detect filters) — keep the camera settings in sync.
+  8000) — keep the camera settings in sync.
 
 These addresses are frequently out of sync with each other — check them before assuming a
 connectivity bug is in the code.

@@ -21,24 +21,25 @@ uv run cal.py
 ```
 
 It serves a page on port **8000**. Open `http://<pi-ip>:8000/` from a laptop on
-the same network. You get the live camera view with 16 boxes on top:
+the same network. Above the live camera view is a row of 16 numbered pads
+(ordered top row 0-5, middle 6-9, bottom 10-15).
 
-- **drag** a box to move it, **drag the yellow corner** to resize
-- **click** to select; **arrow keys** nudge (Shift = x10); the selected box's
-  native-pixel `x y w h` are editable in the readout
+To place a bay:
+
+1. click its pad (or it's armed for you)
+2. click one corner of the bay in the image, then the opposite corner
+3. it advances to the next unplaced pad automatically
+
+Right-click restarts the current bay; **Esc** / **Stop placing** leaves
+placement mode. Then, in edit mode: **drag** a box to move it, **drag the
+yellow corner** to resize, **click** to select, **arrow keys** nudge
+(Shift = x10), or edit the selected box's native-pixel `x y w h` in the readout.
+
 - **Refresh view** re-grabs the frame (or tick `auto 2s`)
-- **Auto-detect** fits the 6/4/6 layout to the bright vertical lane markers
-- **Reset grid** drops back to an even grid
-- **Save layout** writes `spots.json`
-- **Capture empty references** - with the lot **empty** - writes
+- **Clear all** wipes every box and re-arms pad 0
+- **Save layout** writes `spots.json` (partial is fine - resume later)
+- **Capture empty references** - all 16 placed, lot **empty** - writes
   `refs/00.png` .. `15.png` (also saves `spots.json`)
-
-Auto-detect needs 3 rows of at least 2 bright markers each. When a row shows
-exactly `count + 1` markers the bay edges come straight from them; otherwise
-that row is split evenly between its outermost markers. Tune `MARKER_THRESH`
-and the `MARKER_*` filters at the top of `cal.py` if it misses or over-detects.
-
-Boxes are ordered top row 0-5, middle 6-9, bottom 10-15.
 
 ## Run
 
