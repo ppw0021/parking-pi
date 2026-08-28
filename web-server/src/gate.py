@@ -36,7 +36,7 @@ from leds import LedControl
 
 SERVO_ENTRY_PIN = 23
 SERVO_EXIT_PIN = 24
-SERVO_OPEN_ANGLE = {"enter": 70, "exit": 90}
+SERVO_OPEN_ANGLE = {"enter": 90, "exit": 90}
 GATE_DELAY = 5                       # seconds the gate stays open
 
 # LEDs (red, green, blue) per side
