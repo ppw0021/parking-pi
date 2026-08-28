@@ -3,6 +3,8 @@ import sqlite3
 import time
 import re
 
+import gate
+
 # Constant for time (seconds)
 entryGracePeriod = 10
 exitGracePeriod = 300
@@ -57,10 +59,21 @@ def update_hourly_rate():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# Customer panel
+# Customer pages: a three-step flow, all sharing templates/base.html.
+#   /       entry gate  - type your plate, the entry boom opens
+#   /pay    payment     - check what's owed and pay
+#   /exit   exit gate   - type your plate, the exit boom opens if paid up
 @app.route("/")
 def root():
-    return render_template("index.html")
+    return render_template("index.html", active="entry")
+
+@app.route("/pay")
+def pay_page():
+    return render_template("pay.html", active="pay")
+
+@app.route("/exit")
+def exit_page():
+    return render_template("exit.html", active="exit")
 
 # Check if a plate exists
 @app.get("/check_plate/<plate>")
@@ -170,10 +183,8 @@ def get_vehicles():
         cur.close()
         con.close()
 
-# Called by gate-watcher
-
-# Called by gate-watcher 
-# Adds plate and time to database
+# Called by the Entry page (and still by gate-watcher, same contract).
+# Adds plate and time to database; on success pulses the entry boom gate.
 # (210: added | 211: already exists | 213: error or invalid plate format)
 @app.get("/enter/<plate>")
 def enter(plate):
@@ -204,6 +215,8 @@ def enter(plate):
         )
         con.commit()
 
+        gate.open_gate("enter")
+
         return jsonify({
             "message": f"{plate} added"
         }), 210
@@ -218,8 +231,8 @@ def enter(plate):
         cur.close()
         con.close()
 
-# Called by gate-watcher 
-# Checks if plate has paid
+# Called by the Exit page (and still by gate-watcher, same contract).
+# Checks if plate has paid; on success pulses the exit boom gate.
 # (210: car paid, exit allowed | 211: car not paid, exit, not allowed | 212: plate not found | 213: error)
 @app.get("/exit/<plate>")
 def exitLot(plate):
@@ -243,10 +256,12 @@ def exitLot(plate):
             # Delete the entry from the database
             cur.execute("DELETE FROM parkingLot WHERE plate = ?", (plate,))
             con.commit()
+            gate.open_gate("exit")
             return jsonify({
                 "message": f"{plate} paid up, exit permitted"
             }), 210
         else:
+            gate.deny("exit")
             return jsonify({
                 "message": f"{plate} not paid up, exit not permitted"
             }), 211

@@ -8,7 +8,11 @@ A physical parking-lot automation demo built from three **independent** Python s
 run on separate machines (mostly Raspberry Pis) and talk to each other over HTTP on port 5000:
 
 - `web-server/src/` — Flask app: the source of truth for parked vehicles, payments, and live spot
-  occupancy. Serves the customer page (`/`) and admin page (`/admin`).
+  occupancy. Serves a 3-step customer flow (`/` entry gate, `/pay`, `/exit` exit gate) and the
+  admin page (`/admin`). Since gate-watcher proved unreliable, `web-server/src/gate.py` now also
+  drives the boom-gate servos/LEDs directly: `/enter` and `/exit` pulse the gate on a background
+  thread when they return `210`. It uses the same `RPi.GPIO`→`fake_gpio` fallback as gate-watcher,
+  so off a Pi it just prints. gate-watcher is kept but no longer needed.
 - `gate-watcher/src/` — runs on a Pi wired to boom-gate servos, RGB LEDs and buttons. Reads number
   plates from a camera with Tesseract OCR and drives the entry/exit gates.
 - `spot-watcher/src/` — runs on a headless (SSH) Pi with a camera overlooking the bays. Compares

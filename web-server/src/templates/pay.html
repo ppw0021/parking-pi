@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block title %}Parking Service &ndash; Pay{% endblock %}
+
+{% block main %}
+<!-- LEFT PANEL: payment -->
+<section class="left-panel">
+    <h2>Pay for Parking</h2>
+    <p>Enter your number plate to see what's owed, then pay.</p>
+
+    <div id="paymentForm">
+        <div class="form-group">
+            <label for="plateInput">Number Plate</label>
+            <input type="text" id="plateInput" placeholder="e.g. ABC123" autocomplete="off"
+                autocapitalize="characters" autocorrect="off" spellcheck="false" maxlength="6"
+                inputmode="text">
+            <button id="checkBtn">Check</button>
+        </div>
+        <div id="messageBox" class="info-box hidden">
+            <p>message</p>
+        </div>
+        <div id="infoBox" class="info-box hidden">
+            <p><strong>Unpaid time:</strong> <span id="timeParked">--</span></p>
+            <p><strong>Total due:</strong> <span id="totalDue">--</span></p>
+            <button id="payBtn">Pay Now</button>
+        </div>
+    </div>
+
+    <div id="successMessage" class="info-box success hidden">
+        <p>Payment successful. When you're ready, head to the
+            <a href="{{ url_for('exit_page') }}">Exit</a> page to leave.</p>
+        <button id="newPaymentBtn">Pay for another car</button>
+    </div>
+</section>
+
+<!-- RIGHT PANEL: live availability -->
+{% include "_spots.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='pay.js') }}"></script>
+{% endblock %}

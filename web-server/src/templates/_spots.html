@@ -1,0 +1,49 @@
+<!-- Live parking availability board. Shared by every customer page;
+     kept in sync by static/spots.js polling GET /spots every second. -->
+<section class="right-panel">
+    <h2>Parking Spots</h2>
+    <div class="spots-summary" id="spotsSummary">
+        <span id="spotsFree">&ndash;</span> of 16 spots free
+    </div>
+    <div class="legend">
+        <span><span class="swatch available"></span> Available</span>
+        <span><span class="swatch taken"></span> Taken</span>
+    </div>
+    <table id="parkingTable">
+        <tbody>
+            <!-- Row 1 -->
+            <tr>
+                <td class="ref-column">Entry</td>
+                <td class="spot available" data-id="0">1</td>
+                <td class="spot available" data-id="1">2</td>
+                <td class="spot available" data-id="2">3</td>
+                <td class="spot available" data-id="3">4</td>
+                <td class="spot available" data-id="4">5</td>
+                <td class="spot available" data-id="5">6</td>
+            </tr>
+
+            <!-- Row 2 -->
+            <tr>
+                <td class="ref-column">--</td>
+                <td class="road"></td>
+                <td class="spot available" data-id="6">7</td>
+                <td class="spot available" data-id="7">8</td>
+                <td class="spot available" data-id="8">9</td>
+                <td class="spot available" data-id="9">10</td>
+                <td class="road"></td>
+            </tr>
+
+            <!-- Row 3 -->
+            <tr>
+                <td class="ref-column">Exit</td>
+                <td class="spot available" data-id="10">11</td>
+                <td class="spot available" data-id="11">12</td>
+                <td class="spot available" data-id="12">13</td>
+                <td class="spot available" data-id="13">14</td>
+                <td class="spot available" data-id="14">15</td>
+                <td class="spot available" data-id="15">16</td>
+            </tr>
+        </tbody>
+    </table>
+    <p class="muted" id="lastUpdated">Waiting for data&hellip;</p>
+</section>

@@ -32,6 +32,35 @@ header h1 {
     font-size: 1.8rem;
 }
 
+/* ========== Navigation ========== */
+.main-nav {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    background: white;
+    padding: 0.5rem 1rem;
+    box-shadow: 0 2px 5px var(--shadow-color);
+}
+
+.main-nav a {
+    color: var(--primary-color);
+    text-decoration: none;
+    font-weight: bold;
+    padding: 0.6rem 1.2rem;
+    border-radius: 6px;
+    transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+.main-nav a:hover {
+    background-color: #fff4e6;
+}
+
+.main-nav a.active {
+    background-color: var(--primary-color);
+    color: white;
+}
+
 /* ========== Main Layout ========== */
 main {
     display: flex;
@@ -160,6 +189,11 @@ input:focus-visible {
     border: 1px solid var(--border-color);
     border-radius: 4px;
     font-size: 1em;
+}
+
+.info-box a {
+    color: inherit;
+    font-weight: bold;
 }
 
 .info-box.error {
@@ -415,8 +449,26 @@ input:focus-visible {
         font-size: 1.5rem;
     }
 
+    .main-nav {
+        gap: 0.25rem;
+        padding: 0.4rem 0.5rem;
+    }
+
+    .main-nav a {
+        flex: 1 1 auto;
+        text-align: center;
+        padding: 0.6rem 0.4rem;
+    }
+
     .left-panel, .right-panel {
         padding: 1rem;
+    }
+
+    .form-group button,
+    #paymentForm button,
+    #successMessage button {
+        width: 100%;
+        min-width: 0;
     }
 
     #parkingTable td {

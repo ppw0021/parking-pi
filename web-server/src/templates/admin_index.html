@@ -3,6 +3,7 @@
 
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Parking Service - Admin Panel</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
@@ -11,6 +12,13 @@
     <header>
         <h1>Parking Service - Admin Panel</h1>
     </header>
+
+    <nav class="main-nav">
+        <a href="{{ url_for('root') }}">Entry</a>
+        <a href="{{ url_for('pay_page') }}">Pay</a>
+        <a href="{{ url_for('exit_page') }}">Exit</a>
+        <a href="{{ url_for('admin') }}" class="active">Admin</a>
+    </nav>
 
     <main>
         <!-- LEFT PANEL -->

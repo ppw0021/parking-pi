@@ -1,19 +1,19 @@
 {% extends "base.html" %}
 
-{% block title %}Parking Service &ndash; Entry{% endblock %}
+{% block title %}Parking Service &ndash; Exit{% endblock %}
 
 {% block main %}
-<!-- LEFT PANEL: entry gate -->
+<!-- LEFT PANEL: exit gate -->
 <section class="left-panel">
-    <h2>Welcome</h2>
-    <p>Please enter your number plate and the entry gate will open for you.</p>
+    <h2>Exit</h2>
+    <p>Enter your number plate and tap Exit. If you're paid up, the exit gate will open.</p>
 
     <div class="form-group">
         <label for="plateInput">Number Plate</label>
         <input type="text" id="plateInput" placeholder="e.g. ABC123" autocomplete="off"
             autocapitalize="characters" autocorrect="off" spellcheck="false" maxlength="6"
             inputmode="text">
-        <button id="enterBtn">Open Gate</button>
+        <button id="exitBtn">Exit</button>
     </div>
 
     <div id="messageBox" class="info-box hidden">
@@ -26,5 +26,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='entry.js') }}"></script>
+<script src="{{ url_for('static', filename='exit.js') }}"></script>
 {% endblock %}
