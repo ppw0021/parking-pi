@@ -117,29 +117,29 @@ REGIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 LANE_SPLIT = 0.50                    # fallback lane split (fraction of width)
 
 # Inside each calibrated zone, find the single best WHITE rectangle - the
-# number plate.  It is white, roughly 2:1 (long side twice the short) and
-# sits within PLATE_MAX_TILT_DEG of level - the plate's expected
-# orientation is horizontal (cal.py's "rot180" only picks which way up
-# OCR is tried first, it does not change that the plate lies level in the
-# zone).  A candidate must sit inside PLATE_ASPECT +/- PLATE_ASPECT_TOL,
-# cover between PLATE_MIN_FILL and PLATE_MAX_FILL of the zone, be a
-# near-solid rectangle (PLATE_MIN_EXTENT / PLATE_MIN_SOLIDITY) and have
-# its long edge within PLATE_MAX_TILT_DEG of horizontal.  Of the
-# survivors the biggest / most rectangular / most 2:1 wins; if none pass,
-# that lane is NOT OCR'd this pass.
-PLATE_ASPECT = float(os.environ.get("GATE_PLATE_ASPECT", "2.0"))               # long / short
-PLATE_ASPECT_TOL = float(os.environ.get("GATE_PLATE_ASPECT_TOL", "0.40"))      # +/- fraction
-PLATE_MIN_FILL = float(os.environ.get("GATE_PLATE_MIN_FILL", "0.03"))          # min rect / zone area
-PLATE_MAX_FILL = float(os.environ.get("GATE_PLATE_MAX_FILL", "0.92"))          # max rect / zone area
-PLATE_MIN_EXTENT = float(os.environ.get("GATE_PLATE_MIN_EXTENT", "0.62"))      # contour / rect area
-PLATE_MIN_SOLIDITY = float(os.environ.get("GATE_PLATE_MIN_SOLIDITY", "0.88"))  # contour / hull area
+# number plate.  It is white, roughly 2:1 to 3:1, and sits within
+# PLATE_MAX_TILT_DEG of level - the plate's expected orientation is
+# horizontal (cal.py's "rot180" only picks which way up OCR is tried
+# first, it does not change that the plate lies level in the zone).  A
+# candidate must sit inside PLATE_ASPECT +/- PLATE_ASPECT_TOL, cover
+# between PLATE_MIN_FILL and PLATE_MAX_FILL of the zone, be a near-solid
+# rectangle (PLATE_MIN_EXTENT / PLATE_MIN_SOLIDITY) and have its long
+# edge within PLATE_MAX_TILT_DEG of horizontal.  Of the survivors the
+# biggest / most rectangular / most 2.5:1 wins.  Run with GATE_DEBUG=1
+# (or press 'd') to see the white mask and, on the console, why
+# candidates were rejected.
+PLATE_ASPECT = float(os.environ.get("GATE_PLATE_ASPECT", "2.5"))               # long / short (US ~2.0, NZ ~2.8)
+PLATE_ASPECT_TOL = float(os.environ.get("GATE_PLATE_ASPECT_TOL", "0.50"))      # +/- fraction -> ~[1.25, 3.75]
+PLATE_MIN_FILL = float(os.environ.get("GATE_PLATE_MIN_FILL", "0.02"))          # min rect / zone area
+PLATE_MAX_FILL = float(os.environ.get("GATE_PLATE_MAX_FILL", "0.98"))          # max rect / zone area (tight zone = plate fills it)
+PLATE_MIN_EXTENT = float(os.environ.get("GATE_PLATE_MIN_EXTENT", "0.55"))      # contour / rect area
+PLATE_MIN_SOLIDITY = float(os.environ.get("GATE_PLATE_MIN_SOLIDITY", "0.80"))  # contour / hull area
 # Max degrees the plate's long edge may be off the expected (level)
 # orientation.  45 is the hard ceiling: past 45 deg a 2:1 rectangle is
 # indistinguishable from the same rectangle stood on its short end.
 PLATE_MAX_TILT_DEG = min(float(os.environ.get("GATE_PLATE_MAX_TILT_DEG", "45")), 45.0)
-PLATE_WHITE_MAX_SAT = int(os.environ.get("GATE_PLATE_WHITE_MAX_SAT", "95"))    # HSV S ceiling for "white"
-PLATE_WHITE_VAL_MIN = int(os.environ.get("GATE_PLATE_WHITE_VAL_MIN", "110"))   # HSV V hard floor
-PLATE_WHITE_VAL_PCTL = int(os.environ.get("GATE_PLATE_WHITE_VAL_PCTL", "55"))  # HSV V percentile gate
+PLATE_WHITE_MAX_SAT = int(os.environ.get("GATE_PLATE_WHITE_MAX_SAT", "120"))   # HSV S ceiling for "white" (255 disables)
+PLATE_WHITE_VAL_MIN = int(os.environ.get("GATE_PLATE_WHITE_VAL_MIN", "100"))   # HSV V floor: never call a dark zone white
 PLATE_WARP_H = 200
 PLATE_WARP_W = int(round(PLATE_WARP_H * PLATE_ASPECT))
 
@@ -358,22 +358,23 @@ def _orient_quad(pts):
 
 
 def _white_mask(zone):
-    """Binary mask of the bright, low-saturation (white) pixels in a zone,
-    with the black characters and any border nicks sealed shut so the
-    plate reads as one solid slab.  Local-contrast equalised, then
-    thresholded with whichever of {Otsu, brightness percentile, hard
-    floor} is strictest - so a pale car body or bright road nearby is
-    not swallowed into the plate blob."""
+    """Binary mask of the bright, not-too-saturated (white) pixels in a
+    zone, with the black characters and any border nicks sealed into one
+    slab.  Threshold = Otsu on a CLAHE-equalised value channel, but never
+    below PLATE_WHITE_VAL_MIN so a dark zone can't turn all-white.  The
+    saturation ceiling drops obviously coloured regions (set
+    GATE_PLATE_WHITE_MAX_SAT=255 to disable it for a pure B/W rig)."""
     hsv = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV)
     sat, val = hsv[:, :, 1], hsv[:, :, 2]
     val = cv2.createCLAHE(2.0, (8, 8)).apply(val)
     otsu, _ = cv2.threshold(val, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    v_thr = max(float(np.percentile(val, PLATE_WHITE_VAL_PCTL)), otsu,
-                float(PLATE_WHITE_VAL_MIN))
-    mask = ((sat < PLATE_WHITE_MAX_SAT) & (val > v_thr)).astype(np.uint8) * 255
+    v_thr = max(otsu, float(PLATE_WHITE_VAL_MIN))
+    mask = ((val >= v_thr) & (sat <= PLATE_WHITE_MAX_SAT)).astype(np.uint8) * 255
+    # close first (bridge the black glyphs / border gaps), then a small
+    # open to shave speckle without eating a thin plate border
     mask = cv2.morphologyEx(
         mask, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)), iterations=2)
+        cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=2)
     mask = cv2.morphologyEx(
         mask, cv2.MORPH_OPEN,
         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
@@ -405,11 +406,16 @@ def _rect_tilt_deg(box):
     return (np.degrees(np.arctan2(long_e[1], long_e[0])) + 90.0) % 180.0 - 90.0
 
 
+_last_find_diag = ""    # dedupe the DEBUG "why no plate" line
+
+
 def find_plate(zone):
-    """Find the best white ~2:1 rectangle (the number plate) in a zone and
-    rectify it.  Return (rectified_bgr, quad_in_zone_coords), or
-    (None, None) when nothing passes the aspect / rectangularity / tilt
-    gates."""
+    """Find the best white ~2.5:1 rectangle (the number plate) in a zone
+    and rectify it.  Return (rectified_bgr, quad_in_zone_coords, mask), or
+    (None, None, mask) when nothing passes the size / aspect /
+    rectangularity / tilt gates.  With GATE_DEBUG on, logs which gate the
+    candidates fell at (deduped)."""
+    global _last_find_diag
     h, w = zone.shape[:2]
     zone_area = float(w * h)
     mask = _white_mask(zone)
@@ -418,45 +424,57 @@ def find_plate(zone):
     hi = PLATE_ASPECT * (1.0 + PLATE_ASPECT_TOL)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
+    rejects = Counter()
     best_c, best_score = None, 0.0
     for c in contours:
         c_area = cv2.contourArea(c)
-        if c_area < PLATE_MIN_FILL * zone_area:
-            continue
         (cx, cy), (rw, rh), ang = cv2.minAreaRect(c)
-        if min(rw, rh) < 12:
-            continue
         rect_area = rw * rh
+        if c_area < PLATE_MIN_FILL * zone_area or min(rw, rh) < 12:
+            rejects['too small'] += 1
+            continue
         if not (PLATE_MIN_FILL <= rect_area / zone_area <= PLATE_MAX_FILL):
+            rejects['fill'] += 1
             continue
         ratio = max(rw, rh) / min(rw, rh)
-        if not (lo <= ratio <= hi):                  # not ~2:1 -> not a plate
+        if not (lo <= ratio <= hi):
+            rejects['aspect'] += 1
             continue
         extent = c_area / rect_area
         if extent < PLATE_MIN_EXTENT:                # ragged blob, not a slab
+            rejects['extent'] += 1
             continue
         hull_area = cv2.contourArea(cv2.convexHull(c))
         if hull_area <= 0 or c_area / hull_area < PLATE_MIN_SOLIDITY:
+            rejects['solidity'] += 1
             continue
-        box = cv2.boxPoints(((cx, cy), (rw, rh), ang))
-        if abs(_rect_tilt_deg(box)) > PLATE_MAX_TILT_DEG:   # > N deg off level
+        if abs(_rect_tilt_deg(cv2.boxPoints(((cx, cy), (rw, rh), ang)))) > PLATE_MAX_TILT_DEG:
+            rejects['tilt'] += 1
             continue
-        # of the survivors prefer the biggest, most rectangular, most 2:1
+        # of the survivors prefer the biggest, most rectangular, most 2.5:1
         score = (rect_area * extent
                  * (1.0 - min(abs(ratio - PLATE_ASPECT) / PLATE_ASPECT, 1.0)))
         if score > best_score:
             best_c, best_score = c, score
 
     if best_c is None:
-        return None, None
+        if DEBUG:
+            diag = (f"{len(contours)} contours, "
+                    + (", ".join(f"{k} x{v}" for k, v in rejects.most_common())
+                       or "none over the size floor"))
+            if diag != _last_find_diag:
+                _last_find_diag = diag
+                print(f"[find_plate] no plate - {diag}")
+        return None, None, mask
 
+    _last_find_diag = ""
     quad = _orient_quad(_quad_from_contour(best_c))
     dst = np.array([[0, 0], [PLATE_WARP_W - 1, 0],
                     [PLATE_WARP_W - 1, PLATE_WARP_H - 1],
                     [0, PLATE_WARP_H - 1]], dtype="float32")
     warp = cv2.warpPerspective(zone, cv2.getPerspectiveTransform(quad, dst),
                                (PLATE_WARP_W, PLATE_WARP_H))
-    return warp, quad
+    return warp, quad, mask
 
 
 def _plate_cfg(psm):
@@ -556,14 +574,14 @@ def find_and_read(frame, side):
     zone, origin = zone_of(frame, side)
     if zone is None:
         return None
-    plate, quad = find_plate(zone)
+    plate, quad, mask = find_plate(zone)
     if quad is None:                          # rectangle not there yet
         last_quads.pop(side, None)
-        _set_debug_strip([to_ocr_gray(zone)])
+        _set_debug_strip([to_ocr_gray(zone), mask])   # zone | white mask
         return None
     last_quads[side] = quad + np.asarray(origin, dtype="float32")
     text, vis = ocr_plate(plate, REGIONS[side]['rot180'])
-    _set_debug_strip([vis])
+    _set_debug_strip([mask, vis])                     # white mask | OCR input
     return coerce_format(text) if text else ""
 
 
