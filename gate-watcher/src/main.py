@@ -1,5 +1,5 @@
 '''
-GateWatcher v0.0.12 (20260828_1318):
+GateWatcher v0.0.13 (20260828_1745):
 The code monitors the gates of a parking lot.
 If a license plate is detected on the right part of the creen,
 It means a car is entering, so the code will issue a call to the server:
@@ -108,7 +108,7 @@ GateWatcher v0.0.11 (20251019):
 GateWatcher v0.0.12 (20251019):
  - reply 212 from the server is an error and will be handled as such:
   reply 213/212 errors -> RED blink 3x @1 Hz
-  
+
 GateWatcher v0.0.13 (20260828):
 - Manual USB camera calibration added.
 - Disable camera auto exposure, auto white balance and
