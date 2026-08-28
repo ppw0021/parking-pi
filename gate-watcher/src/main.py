@@ -1,5 +1,5 @@
 '''
-GateWatcher v0.0.12 (20260827_1113):
+GateWatcher v0.0.13 (20260828_1745):
 The code monitors the gates of a parking lot.
 If a license plate is detected on the right part of the creen,
 It means a car is entering, so the code will issue a call to the server:
@@ -108,7 +108,24 @@ GateWatcher v0.0.11 (20251019):
 GateWatcher v0.0.12 (20251019):
  - reply 212 from the server is an error and will be handled as such:
   reply 213/212 errors -> RED blink 3x @1 Hz
-'''
+
+GateWatcher v0.0.13 (20260828):
+- Manual USB camera calibration added.
+- Disable camera auto exposure, auto white balance and
+  dynamic frame rate control.
+- Fine Tune window now includes camera parameter sliders:
+  brightness, contrast, exposure, gain,
+  white balance, saturation, sharpness and backlight compensation.
+- Camera settings are applied immediately via v4l2-ctl.
+- ROI is cropped before OCR to remove plate borders and
+  surrounding background (CROP_PERCENTAGE).
+- OCR debug windows added:
+  "OCR ROI" and "OCR TH".
+- print_fine_tune_settings() now outputs camera and OCR settings.
+- Detection thresholds updated:
+  AREA_MIN=15000, AREA_MAX=35000,
+  ASPECT_MIN=2.5, ASPECT_MAX=5.0.
+  '''
 import requests
 from time import sleep
 import cv2
@@ -120,6 +137,13 @@ from datetime import datetime
 import re
 import RPi.GPIO as GPIO
 import subprocess
+
+# ------------- Camera selection --------------------------------------------
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    Picamera2 = None
+
 # ------------- GPIO base setup ---------------------------------------------
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
@@ -143,9 +167,21 @@ SERVO_ENTRY_PIN  = 23  # Entry gate servo
 SERVO_EXIT_PIN   = 24  # Exit gate servo
 # Gate deay
 GATE_DELAY = 5
+# Exit bay side flag: when True, Exit is on the right side
+EXIT_ON_RIGHT = False
+# Hardware controls
+HW_CONTROL_ENABLED = False
 # Setup button pins
-GPIO.setup(ENTRY_BUTTON_PIN, GPIO.IN)
-GPIO.setup(EXIT_BUTTON_PIN,  GPIO.IN)
+GPIO.setup(
+    ENTRY_BUTTON_PIN,
+    GPIO.IN,
+    pull_up_down=GPIO.PUD_UP,
+)
+GPIO.setup(
+    EXIT_BUTTON_PIN,
+    GPIO.IN,
+    pull_up_down=GPIO.PUD_UP,
+)
 # Setup LED pins
 for pin in ENTRY_LED_PINS:
     GPIO.setup(pin, GPIO.OUT)
@@ -158,15 +194,17 @@ GPIO.setup(SERVO_EXIT_PIN,  GPIO.OUT)
 from leds import LedControl
 led = LedControl(ENTRY_LED_PINS, EXIT_LED_PINS)
 # ---------------- Configuration --------------------------------------------
-CAMERA_INDEX = 1
+USE_PICAMERA = False
+CAMERA_INDEX = 0
 CAMERA_DEVICE = f"/dev/video{CAMERA_INDEX}"
 # WEB_PI_IP = "http://10.138.63.88" # old location
-# WEB_PI_IP = "http://192.168.1.16"    # current location
-# WEB_PI_IP =  "http://10.130.1.206"
-WEB_PI_IP =  "http://10.0.0.2"
+# WEB_PI_IP = "http://192.168.1.17"    # current location
+# WEB_PI_IP =  "http://10.130.1.228"
+WEB_PI_IP =  "http://192.168.137.2"
 URL = f"{WEB_PI_IP}:5000"
-ASPECT_MIN = 2.0
-ASPECT_MAX = 6.0
+CROP_PERCENTAGE = 0.10
+ASPECT_MIN = 2.5
+ASPECT_MAX = 5.0
 MAX_CANDIDATES = 10
 PRINT_ALL_OCR = True
 # Zone thresholds (fractions of frame width)
@@ -177,11 +215,11 @@ EXIT_ON_RIGHT = True
 # Strict plate pattern: AAA999
 RE_PLATE = re.compile(r'^[A-Z]{3}\d{3}$')
 # Auto-IDLE settings
-AUTO_IDLE_ENABLED   = True
+AUTO_IDLE_ENABLED   = False
 MAX_TIME_TO_IDLE    = 10.0  # seconds without a spot -> go IDLE
 # OCR confidences and rules
-MIN_SAMPLE_CONF = 40.0
-MIN_FINAL_CONF  = 50.0
+MIN_SAMPLE_CONF = 10.0
+MIN_FINAL_CONF  = 10.0
 MIN_FINAL_LEN   = (6, 6)
 MIN_FINAL_SAMPLES = 1
 # NEW: softer threshold for 6-char alias keys
@@ -196,8 +234,8 @@ TESS_CFG_FALLBACK = (
     "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 # Image area settings (bbox area filter controlled by [ / ])
-AREA_MIN     = 7300
-AREA_MAX     = 12000
+AREA_MIN     = 15000
+AREA_MAX     = 35000
 AREA_STEP    = 500
 AREA_ABS_MIN = 500
 AREA_ABS_MAX = 40000
@@ -206,9 +244,19 @@ area_max = AREA_MAX
 CONTRAST = 245
 BRIGHTNESS = 85
 
+# Manual camera controls
+CAMERA_AUTO_EXPOSURE = 1          # Manual mode
+CAMERA_EXPOSURE = 30
+CAMERA_GAIN = 140
+CAMERA_WB_AUTO = 0
+CAMERA_WB_TEMP = 4140
+CAMERA_SATURATION = 128
+CAMERA_SHARPNESS = 128
+CAMERA_BACKLIGHT = 1
+
 # Fine-tune image processing settings
-DARK_THRESHOLD = 128
-LIGHT_THRESHOLD = 240
+DARK_THRESHOLD = 30
+LIGHT_THRESHOLD = 220
 CANNY_LOW = 64
 CANNY_HIGH = 200
 DILATION_ITERATIONS = 2
@@ -334,16 +382,23 @@ def set_gate(gate_id: int, close: bool):
     finally:
         pwm.stop()
     print(f"Moved servo to {angle}° (duty {duty:.2f}%)")
+
 def read_gpio_state():
     """
     Function: read_gpio_state
-    Purpose: Sample button pins; HIGH means active per wiring.
-    Methods: GPIO.input() on ENTRY_BUTTON_PIN/EXIT_BUTTON_PIN.
-    Creates: two booleans (enter_high, exit_high).
+    Purpose: Read active-low entry and exit hardware buttons.
+    Methods: Read GPIO inputs configured with internal pull-up resistors.
+    Creates: Two booleans indicating whether each button is pressed.
     """
-    enter_high = (GPIO.input(ENTRY_BUTTON_PIN) == GPIO.HIGH)
-    exit_high  = (GPIO.input(EXIT_BUTTON_PIN)  == GPIO.HIGH)
-    return enter_high, exit_high
+    enter_pressed = (
+        GPIO.input(ENTRY_BUTTON_PIN) == GPIO.LOW
+    )
+    exit_pressed = (
+        GPIO.input(EXIT_BUTTON_PIN) == GPIO.LOW
+    )
+
+    return enter_pressed, exit_pressed
+
 def set_brightness(value):
     """
     Function: set_brightness
@@ -351,6 +406,10 @@ def set_brightness(value):
     Methods: Clamp 0..255; subprocess.call().
     Creates: none.
     """
+    # Leave whe using PiCamera:
+    if USE_PICAMERA:
+        return value
+
     value = max(0, min(255, value))
     subprocess.call([
         "v4l2-ctl", f"--device={CAMERA_DEVICE}",
@@ -365,6 +424,10 @@ def set_contrast(value):
     Methods: Clamp 0..255; subprocess.call().
     Creates: none.
     """
+    # Leave whe using PiCamera:
+    if USE_PICAMERA:
+        return value
+
     value = max(0, min(255, value))
     subprocess.call([
         "v4l2-ctl", f"--device={CAMERA_DEVICE}",
@@ -379,6 +442,10 @@ def set_gain(value):
     Methods: Clamp 0..255; subprocess.call().
     Creates: none.
     """
+    # Leave whe using PiCamera:
+    if USE_PICAMERA:
+        return value
+
     value = max(0, min(255, value))
     subprocess.call([
         "v4l2-ctl", f"--device={CAMERA_DEVICE}",
@@ -386,6 +453,146 @@ def set_gain(value):
     ])
     print(f"Gain: {value}")
     return value
+
+def set_camera_ctrl(name, value):
+    """
+    Function: set_camera_ctrl
+    Purpose: Set any UVC control through v4l2-ctl.
+    Methods: subprocess.call().
+    Creates: none.
+    """
+
+    # Leave whe using PiCamera:
+    if USE_PICAMERA:
+        return value
+
+    subprocess.call([
+        "v4l2-ctl",
+        f"--device={CAMERA_DEVICE}",
+        "--set-ctrl",
+        f"{name}={value}"
+    ])
+    print(f"{name}: {value}")
+
+
+def disable_camera_auto_controls():
+    """
+    Function: disable_camera_auto_controls
+    Purpose: Disable camera auto tuning and apply manual values.
+    """
+
+    set_camera_ctrl("white_balance_automatic", 0)
+    set_camera_ctrl("auto_exposure", 1)
+    set_camera_ctrl("exposure_dynamic_framerate", 0)
+
+    set_camera_ctrl(
+        "white_balance_temperature",
+        CAMERA_WB_TEMP,
+    )
+
+    set_camera_ctrl(
+        "exposure_time_absolute",
+        CAMERA_EXPOSURE,
+    )
+
+    set_camera_ctrl("gain", CAMERA_GAIN)
+    set_camera_ctrl("saturation", CAMERA_SATURATION)
+    set_camera_ctrl("sharpness", CAMERA_SHARPNESS)
+    set_camera_ctrl(
+        "backlight_compensation",
+        CAMERA_BACKLIGHT,
+    )
+
+    set_brightness(BRIGHTNESS)
+    set_contrast(CONTRAST)
+
+def open_camera():
+    """
+    Function: open_camera
+    Purpose: Open either USB camera or Pi Camera.
+    """
+
+    if USE_PICAMERA:
+        if Picamera2 is None:
+            raise RuntimeError(
+                "Picamera2 module is not installed."
+            )
+
+        cam = Picamera2()
+
+        config = cam.create_preview_configuration(
+            main={
+                "size": CAMERA_RESOLUTION,
+                "format": "RGB888",
+            }
+        )
+
+        cam.configure(config)
+        cam.start()
+
+        cam.set_controls({
+            "AeEnable": False,
+            "AwbEnable": False,
+            "ExposureTime": 15000,
+            "AnalogueGain": 1.0,
+        })
+
+        return cam
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_WIDTH,
+        CAMERA_RESOLUTION[0]
+    )
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_HEIGHT,
+        CAMERA_RESOLUTION[1]
+    )
+
+    return cap
+
+def read_camera(camera):
+    """
+    Function: read_camera
+    Purpose: Read frame from selected backend.
+    """
+
+    if USE_PICAMERA:
+        frame = camera.capture_array()
+
+        frame = cv2.cvtColor(
+            frame,
+            cv2.COLOR_RGB2BGR
+        )
+
+        return True, frame
+
+    return camera.read()
+
+def close_camera(camera):
+    """
+    Function: close_camera
+    Purpose: Release camera resources.
+    """
+
+    if USE_PICAMERA:
+        camera.stop()
+    else:
+        camera.release()
+
+def configure_picamera(camera):
+    """
+    Function: configure_picamera
+    Purpose: Apply Pi Camera controls.
+    """
+
+    camera.set_controls({
+        "AeEnable": False,
+        "AwbEnable": False,
+    })
+
 def preprocess_roi(roi_bgr):
     """
     Function: preprocess_roi
@@ -795,12 +1002,23 @@ def ocr_bbox(frame, box, side_hint=None):
     y2 = min(frame.shape[0], y + h + pad_y)
 
     roi = frame[y1:y2, x1:x2]
+    h, w = roi.shape[:2]
+
+    crop_x = int(w * CROP_PERCENTAGE)
+    crop_y = int(h * CROP_PERCENTAGE*1.5)
+
+    roi = roi[
+        crop_y:h - crop_y,
+        crop_x:w - crop_x
+    ]
     if side_hint == 'exit':
         roi = cv2.rotate(roi, cv2.ROTATE_180)
     roi = cv2.resize(
         roi, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC
     )
     th = preprocess_roi(roi)
+    cv2.imshow("OCR ROI", roi) # DBG
+    cv2.imshow("OCR TH", th)   # DBG
     raw, conf = ocr_text_and_conf(th)
     plate_strict = normalize_plate(raw)
     plate_alias  = alias_key_for_streak(raw)
@@ -1019,6 +1237,10 @@ def fine_tune_trackbar_changed(_value):
     Methods: Read all controls and enforce valid minimum/maximum pairs.
     Creates: Updated global image-processing constants.
     """
+    global BRIGHTNESS
+    global CONTRAST, CAMERA_EXPOSURE, CAMERA_GAIN
+    global CAMERA_WB_TEMP, CAMERA_SATURATION
+    global CAMERA_SHARPNESS, CAMERA_BACKLIGHT
     global DARK_THRESHOLD, LIGHT_THRESHOLD
     global CANNY_LOW, CANNY_HIGH, DILATION_ITERATIONS
     global ASPECT_MIN, ASPECT_MAX, area_min, area_max
@@ -1027,6 +1249,79 @@ def fine_tune_trackbar_changed(_value):
     main_keyboard_active = False
     if fine_tune_trackbar_update:
         return
+
+    BRIGHTNESS = cv2.getTrackbarPos(
+        "Brightness",
+        FINE_TUNE_WINDOW,
+    )
+
+    CONTRAST = cv2.getTrackbarPos(
+        "Contrast",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_EXPOSURE = cv2.getTrackbarPos(
+        "Exposure",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_GAIN = cv2.getTrackbarPos(
+        "Gain",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_WB_TEMP = cv2.getTrackbarPos(
+        "WB Temp",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_SATURATION = cv2.getTrackbarPos(
+        "Saturation",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_SHARPNESS = cv2.getTrackbarPos(
+        "Sharpness",
+        FINE_TUNE_WINDOW,
+    )
+
+    CAMERA_BACKLIGHT = cv2.getTrackbarPos(
+        "Backlight",
+        FINE_TUNE_WINDOW,
+    )
+
+    set_brightness(BRIGHTNESS)
+    set_contrast(CONTRAST)
+
+    set_camera_ctrl(
+        "exposure_time_absolute",
+        CAMERA_EXPOSURE,
+    )
+
+    set_camera_ctrl(
+        "white_balance_temperature",
+        CAMERA_WB_TEMP,
+    )
+
+    set_camera_ctrl(
+        "gain",
+        CAMERA_GAIN,
+    )
+
+    set_camera_ctrl(
+        "saturation",
+        CAMERA_SATURATION,
+    )
+
+    set_camera_ctrl(
+        "sharpness",
+        CAMERA_SHARPNESS,
+    )
+
+    set_camera_ctrl(
+       "backlight_compensation",
+        CAMERA_BACKLIGHT,
+    )
 
     DARK_THRESHOLD = cv2.getTrackbarPos("Dark", FINE_TUNE_WINDOW)
     LIGHT_THRESHOLD = cv2.getTrackbarPos("Light", FINE_TUNE_WINDOW)
@@ -1065,6 +1360,14 @@ def sync_fine_tune_trackbars():
 
     fine_tune_trackbar_update = True
     values = (
+        ("Brightness", int(BRIGHTNESS)),
+        ("Contrast", int(CONTRAST)),
+        ("Exposure", int(CAMERA_EXPOSURE)),
+        ("Gain", int(CAMERA_GAIN)),
+        ("WB Temp", int(CAMERA_WB_TEMP)),
+        ("Saturation", int(CAMERA_SATURATION)),
+        ("Sharpness", int(CAMERA_SHARPNESS)),
+        ("Backlight", int(CAMERA_BACKLIGHT)),
         ("Dark", int(DARK_THRESHOLD)),
         ("Light", int(LIGHT_THRESHOLD)),
         ("Area min", int(area_min)),
@@ -1093,6 +1396,14 @@ def create_fine_tune_window():
     cv2.namedWindow(FINE_TUNE_WINDOW, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(FINE_TUNE_WINDOW, on_mask_mouse)
     controls = (
+        ("Brightness", 255),
+        ("Contrast", 255),
+        ("Exposure", 50),
+        ("Gain", 255),
+        ("WB Temp", 7500),
+        ("Saturation", 255),
+        ("Sharpness", 255),
+        ("Backlight", 1),
         ("Dark", 255),
         ("Light", 255),
         ("Area min", AREA_ABS_MAX),
@@ -1221,6 +1532,16 @@ def print_fine_tune_settings(title="Settings"):
     Creates: Terminal output only.
     """
     print(f"[fine-tune] {title}:")
+
+    print(f"BRIGHTNESS = {BRIGHTNESS}")
+    print(f"CONTRAST = {CONTRAST}")
+    print(f"CAMERA_EXPOSURE = {CAMERA_EXPOSURE}")
+    print(f"CAMERA_GAIN = {CAMERA_GAIN}")
+    print(f"CAMERA_WB_TEMP = {CAMERA_WB_TEMP}")
+    print(f"CAMERA_SATURATION = {CAMERA_SATURATION}")
+    print(f"CAMERA_SHARPNESS = {CAMERA_SHARPNESS}")
+    print(f"CAMERA_BACKLIGHT = {CAMERA_BACKLIGHT}")
+
     print(f"DARK_THRESHOLD = {DARK_THRESHOLD}")
     print(f"LIGHT_THRESHOLD = {LIGHT_THRESHOLD}")
     print(f"ASPECT_MIN = {ASPECT_MIN:.3f}")
@@ -1394,18 +1715,31 @@ def main():
     global next_read_ts, scan_mode, show_zones
     global area_min, area_max, fine_tune_last_print
 
-    print(
-        "Press 'e' ENTER, 'x' EXIT, 'd' fine-tune, 's' snapshot, "
-        "'z' zones, 'a' manual spot, '['/']' area, 'q' quit."
-    )
+    if HW_CONTROL_ENABLED:
+        print(
+            "HW controls enabled: GPIO buttons select ENTER and EXIT. "
+            "Press 'd' fine-tune, 'v' zones, 's' snapshot, "
+            "'a' manual spot, or 'q' quit."
+        )
+    else:
+        print(
+            "HW controls disabled: press 'z' ENTER, 'x' EXIT, "
+            "'d' fine-tune, 'v' zones, 's' snapshot, "
+            "'a' manual spot, or 'q' quit."
+        )
+
     cv2.namedWindow(MAIN_WINDOW)
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_RESOLUTION[0])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_RESOLUTION[1])
-    if not cap.isOpened():
+    cap = open_camera()
+
+    if not USE_PICAMERA and not cap.isOpened():
         print("ERROR: Cannot open USB camera!")
         GPIO.cleanup()
         return
+    
+    if USE_PICAMERA:
+        configure_picamera(cap)
+    else:
+        disable_camera_auto_controls()
 
     cv2.setMouseCallback(MAIN_WINDOW, on_mouse, None)
     next_read_ts = 0.0
@@ -1414,9 +1748,12 @@ def main():
     brightness = BRIGHTNESS
     contrast = CONTRAST
 
+    previous_enter_pressed = False
+    previous_exit_pressed = False
+
     try:
         while True:
-            ok, frame = cap.read()
+            ok, frame = read_camera(cap)
             if not ok or frame is None:
                 time.sleep(0.02)
                 continue
@@ -1424,12 +1761,16 @@ def main():
             cv2.setMouseCallback(MAIN_WINDOW, on_mouse, frame)
             now = time.monotonic()
 
-            if not fine_tune_active:
-                enter_high, exit_high = read_gpio_state()
-                if exit_high:
-                    toggle_mode('exit')
-                elif enter_high:
+            if not fine_tune_active and HW_CONTROL_ENABLED:
+                enter_pressed, exit_pressed = read_gpio_state()
+
+                if enter_pressed and not previous_enter_pressed:
                     toggle_mode('enter')
+                elif exit_pressed and not previous_exit_pressed:
+                    toggle_mode('exit')
+
+                previous_enter_pressed = enter_pressed
+                previous_exit_pressed = exit_pressed
 
             boxes = find_plate_candidates(frame)
             best_left, best_right = pick_best_by_side(
@@ -1555,13 +1896,16 @@ def main():
                 name = datetime.now().strftime("gate_%Y%m%d_%H%M%S.jpg")
                 cv2.imwrite(name, vis)
                 print(f"Frame saved into {name}")
-            elif key == ord('e'):
+            elif not HW_CONTROL_ENABLED and key == ord('z'):
                 toggle_mode('enter')
-            elif key == ord('x'):
+            elif not HW_CONTROL_ENABLED and key == ord('x'):
                 toggle_mode('exit')
-            elif key == ord('z'):
+            elif key == ord('v'):
                 show_zones = not show_zones
-                print(f"Zone overlay: {'ON' if show_zones else 'OFF'}")
+                print(
+                    f"Zone overlay: "
+                    f"{'ON' if show_zones else 'OFF'}"
+                )
             elif key == ord('a'):
                 manual_select_and_process(frame, boxes)
             elif key == ord('['):
@@ -1586,7 +1930,7 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted by Ctrl+C. Exiting...")
     finally:
-        cap.release()
+        close_camera(cap)
         cv2.destroyAllWindows()
         GPIO.cleanup()
 
