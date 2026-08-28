@@ -14,11 +14,10 @@ live preview until the driver asks to be let through:
 
 ...and only then is that lane read - a blocking job:
 
-  1. poll frames until the plate shows up in the zone - a dark ~2:1
-     border enclosing a white field (within 45 deg of level), or,
-     failing that, a bare white ~2:1 blob;
-  2. deskew the white interior and OCR just that crop, the way up
-     cal.py's rot180 flag says (the 180 deg flip is a fallback only);
+  1. poll frames until the white ~2:1 rectangle (within 45 deg of
+     level) shows up in the zone;
+  2. deskew it and OCR just that crop, the way up cal.py's rot180
+     flag says (the 180 deg flip is a fallback only);
   3. repeat 1-2 until READS_PER_COMMIT samples are gathered (or
      ACQUIRE_TIMEOUT_SEC elapses);
   4. take the most common sample and accept it only if it is exactly
@@ -117,41 +116,30 @@ REGIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "regions.json")
 LANE_SPLIT = 0.50                    # fallback lane split (fraction of width)
 
-# Finding the plate inside a calibrated zone.
-#
-# The plate props carry a solid dark BORDER around a white field, so the
-# primary detector looks for exactly that: a dark rectangle enclosing
-# one bright rectangular hole - a signature almost nothing else in a
-# car park produces - with both parts ~2:1 and roughly concentric.  The
-# white interior (the hole) is what gets warped out for OCR.  If no
-# bordered candidate is found (border broken, odd lighting, borderless
-# plate) it falls back to the older method: the largest bright,
-# low-saturation ~2:1 blob.
-#
-# Shared shape gates: aspect within PLATE_ASPECT +/- PLATE_ASPECT_TOL,
-# size PLATE_MIN_FILL..PLATE_MAX_FILL of the zone, long edge within
-# PLATE_MAX_TILT_DEG of level (45 is the ceiling - past that a 2:1
-# rectangle looks like its upright twin).
+# Inside each calibrated zone, find the single best WHITE rectangle - the
+# number plate.  It is white, roughly 2:1 (long side twice the short) and
+# sits within PLATE_MAX_TILT_DEG of level - the plate's expected
+# orientation is horizontal (cal.py's "rot180" only picks which way up
+# OCR is tried first, it does not change that the plate lies level in the
+# zone).  A candidate must sit inside PLATE_ASPECT +/- PLATE_ASPECT_TOL,
+# cover between PLATE_MIN_FILL and PLATE_MAX_FILL of the zone, be a
+# near-solid rectangle (PLATE_MIN_EXTENT / PLATE_MIN_SOLIDITY) and have
+# its long edge within PLATE_MAX_TILT_DEG of horizontal.  Of the
+# survivors the biggest / most rectangular / most 2:1 wins; if none pass,
+# that lane is NOT OCR'd this pass.
 PLATE_ASPECT = float(os.environ.get("GATE_PLATE_ASPECT", "2.0"))               # long / short
 PLATE_ASPECT_TOL = float(os.environ.get("GATE_PLATE_ASPECT_TOL", "0.40"))      # +/- fraction
 PLATE_MIN_FILL = float(os.environ.get("GATE_PLATE_MIN_FILL", "0.03"))          # min rect / zone area
 PLATE_MAX_FILL = float(os.environ.get("GATE_PLATE_MAX_FILL", "0.92"))          # max rect / zone area
-PLATE_MAX_TILT_DEG = min(float(os.environ.get("GATE_PLATE_MAX_TILT_DEG", "45")), 45.0)
-
-# Primary detector - the dark border.
-PLATE_BORDER_DARK_CLOSE = int(os.environ.get("GATE_PLATE_BORDER_CLOSE", "5"))       # px, bridge breaks in a thin border
-PLATE_HOLE_FILL_MIN = float(os.environ.get("GATE_PLATE_HOLE_FILL_MIN", "0.30"))     # white hole / outer-border area
-PLATE_HOLE_FILL_MAX = float(os.environ.get("GATE_PLATE_HOLE_FILL_MAX", "0.95"))
-PLATE_HOLE_CONCENTRIC = float(os.environ.get("GATE_PLATE_HOLE_CONCENTRIC", "0.18")) # centre offset / outer diagonal
-PLATE_INNER_INSET = float(os.environ.get("GATE_PLATE_INNER_INSET", "0.02"))         # shrink hole quad before warp
-
-# Fallback detector - the white blob (needs the extra HSV / shape knobs).
 PLATE_MIN_EXTENT = float(os.environ.get("GATE_PLATE_MIN_EXTENT", "0.62"))      # contour / rect area
 PLATE_MIN_SOLIDITY = float(os.environ.get("GATE_PLATE_MIN_SOLIDITY", "0.88"))  # contour / hull area
+# Max degrees the plate's long edge may be off the expected (level)
+# orientation.  45 is the hard ceiling: past 45 deg a 2:1 rectangle is
+# indistinguishable from the same rectangle stood on its short end.
+PLATE_MAX_TILT_DEG = min(float(os.environ.get("GATE_PLATE_MAX_TILT_DEG", "45")), 45.0)
 PLATE_WHITE_MAX_SAT = int(os.environ.get("GATE_PLATE_WHITE_MAX_SAT", "95"))    # HSV S ceiling for "white"
 PLATE_WHITE_VAL_MIN = int(os.environ.get("GATE_PLATE_WHITE_VAL_MIN", "110"))   # HSV V hard floor
 PLATE_WHITE_VAL_PCTL = int(os.environ.get("GATE_PLATE_WHITE_VAL_PCTL", "55"))  # HSV V percentile gate
-
 PLATE_WARP_H = 200
 PLATE_WARP_W = int(round(PLATE_WARP_H * PLATE_ASPECT))
 
@@ -417,94 +405,15 @@ def _rect_tilt_deg(box):
     return (np.degrees(np.arctan2(long_e[1], long_e[0])) + 90.0) % 180.0 - 90.0
 
 
-def _inset_quad(quad, frac):
-    """Move each corner toward the quad's centroid by `frac` of its
-    distance from that centroid (frac 0 = unchanged)."""
-    quad = np.asarray(quad, dtype="float32")
-    c = quad.mean(axis=0)
-    return (c + (quad - c) * (1.0 - frac)).astype("float32")
-
-
-def _aspect_ok(rw, rh, lo, hi):
-    return min(rw, rh) > 0 and lo <= max(rw, rh) / min(rw, rh) <= hi
-
-
-def _find_framed_plate(zone):
-    """Primary detector: a dark rectangular border enclosing one bright
-    rectangular hole.  Returns (outer_quad, hole_quad) ordered TL-TR-BR-BL,
-    or (None, None).  outer_quad is the whole plate (for the overlay),
-    hole_quad is the white field (for the warp)."""
-    h, w = zone.shape[:2]
-    zone_area = float(w * h)
-    gray = cv2.GaussianBlur(cv2.cvtColor(zone, cv2.COLOR_BGR2GRAY), (5, 5), 0)
-    _, dark = cv2.threshold(gray, 0, 255,
-                            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    n = max(1, PLATE_BORDER_DARK_CLOSE)
-    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE,
-                            cv2.getStructuringElement(cv2.MORPH_RECT, (n, n)))
-    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN,
-                            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-
-    cnts, hier = cv2.findContours(dark, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    if hier is None:
-        return None, None
-    hier = hier[0]
-    lo = PLATE_ASPECT * (1.0 - PLATE_ASPECT_TOL)
-    hi = PLATE_ASPECT * (1.0 + PLATE_ASPECT_TOL)
-
-    best, best_score = None, 0.0
-    for i, c in enumerate(cnts):
-        if hier[i][3] != -1 or hier[i][2] == -1:      # need a top-level ring
-            continue                                   # with at least one hole
-        (ocx, ocy), (ow, oh), oang = cv2.minAreaRect(c)
-        if min(ow, oh) < 16:
-            continue
-        outer_area = ow * oh
-        if not (PLATE_MIN_FILL <= outer_area / zone_area <= PLATE_MAX_FILL):
-            continue
-        if not _aspect_ok(ow, oh, lo, hi):
-            continue
-        obox = cv2.boxPoints(((ocx, ocy), (ow, oh), oang))
-        if abs(_rect_tilt_deg(obox)) > PLATE_MAX_TILT_DEG:
-            continue
-
-        # biggest child contour = the white interior
-        child, ci = None, hier[i][2]
-        while ci != -1:
-            if child is None or cv2.contourArea(cnts[ci]) > cv2.contourArea(child):
-                child = cnts[ci]
-            ci = hier[ci][0]
-        (hcx, hcy), (hw, hh), _ = cv2.minAreaRect(child)
-        if min(hw, hh) < 8:
-            continue
-        off = float(np.hypot(hcx - ocx, hcy - ocy))
-        odiag = float(np.hypot(ow, oh))
-        if not (PLATE_HOLE_FILL_MIN <= (hw * hh) / outer_area <= PLATE_HOLE_FILL_MAX):
-            continue                                   # hole too small / no real border
-        if off > PLATE_HOLE_CONCENTRIC * odiag:
-            continue                                   # hole not centred in the frame
-        if not _aspect_ok(hw, hh, lo * 0.8, hi * 1.25):
-            continue
-
-        oratio = max(ow, oh) / min(ow, oh)
-        score = (outer_area
-                 * (1.0 - min(abs(oratio - PLATE_ASPECT) / PLATE_ASPECT, 1.0))
-                 * (1.0 - off / (odiag + 1e-6)))
-        if score > best_score:
-            best, best_score = (c, child), score
-
-    if best is None:
-        return None, None
-    return (_orient_quad(_quad_from_contour(best[0])),
-            _orient_quad(_quad_from_contour(best[1])))
-
-
-def _find_white_blob(zone):
-    """Fallback detector: the largest bright, low-saturation ~2:1
-    rectangle.  Returns an ordered quad or None."""
+def find_plate(zone):
+    """Find the best white ~2:1 rectangle (the number plate) in a zone and
+    rectify it.  Return (rectified_bgr, quad_in_zone_coords), or
+    (None, None) when nothing passes the aspect / rectangularity / tilt
+    gates."""
     h, w = zone.shape[:2]
     zone_area = float(w * h)
     mask = _white_mask(zone)
+
     lo = PLATE_ASPECT * (1.0 - PLATE_ASPECT_TOL)
     hi = PLATE_ASPECT * (1.0 + PLATE_ASPECT_TOL)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
@@ -532,35 +441,22 @@ def _find_white_blob(zone):
         box = cv2.boxPoints(((cx, cy), (rw, rh), ang))
         if abs(_rect_tilt_deg(box)) > PLATE_MAX_TILT_DEG:   # > N deg off level
             continue
+        # of the survivors prefer the biggest, most rectangular, most 2:1
         score = (rect_area * extent
                  * (1.0 - min(abs(ratio - PLATE_ASPECT) / PLATE_ASPECT, 1.0)))
         if score > best_score:
             best_c, best_score = c, score
-    return None if best_c is None else _orient_quad(_quad_from_contour(best_c))
 
+    if best_c is None:
+        return None, None
 
-def find_plate(zone):
-    """Locate the number plate in a zone and rectify its white interior
-    for OCR.  Primary: a dark ~2:1 border around a bright rectangular
-    hole (the printed plate border).  Fallback: the largest white ~2:1
-    blob.  Returns (rectified_bgr, quad_in_zone_coords) - quad is the
-    outline drawn on the overlay - or (None, None)."""
-    outer_quad, hole_quad = _find_framed_plate(zone)
-    if hole_quad is not None:
-        src = _inset_quad(hole_quad, PLATE_INNER_INSET)   # warp just the field
-        outline = outer_quad
-    else:
-        blob = _find_white_blob(zone)
-        if blob is None:
-            return None, None
-        src, outline = blob, blob
-
+    quad = _orient_quad(_quad_from_contour(best_c))
     dst = np.array([[0, 0], [PLATE_WARP_W - 1, 0],
                     [PLATE_WARP_W - 1, PLATE_WARP_H - 1],
                     [0, PLATE_WARP_H - 1]], dtype="float32")
-    warp = cv2.warpPerspective(zone, cv2.getPerspectiveTransform(src, dst),
+    warp = cv2.warpPerspective(zone, cv2.getPerspectiveTransform(quad, dst),
                                (PLATE_WARP_W, PLATE_WARP_H))
-    return warp, outline
+    return warp, quad
 
 
 def _plate_cfg(psm):
