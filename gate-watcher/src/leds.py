@@ -12,7 +12,11 @@ Creates: No global state beyond kept pin mapping.
 """
 
 import time
-import RPi.GPIO as GPIO
+
+try:
+    import RPi.GPIO as GPIO
+except (ImportError, RuntimeError):   # not on a Pi
+    import fake_gpio as GPIO
 
 
 class LedControl:
