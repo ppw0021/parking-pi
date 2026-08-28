@@ -17,4 +17,5 @@ dependencies = [
     "numpy>=2.2.0",
     "pytesseract>=0.3.10",
     "rpi-lgpio>=0.6",
+    "picamera2>=0.3.37",
 ]

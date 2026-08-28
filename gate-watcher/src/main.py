@@ -137,6 +137,13 @@ from datetime import datetime
 import re
 import RPi.GPIO as GPIO
 import subprocess
+
+# ------------- Camera selection --------------------------------------------
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    Picamera2 = None
+
 # ------------- GPIO base setup ---------------------------------------------
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
@@ -187,12 +194,13 @@ GPIO.setup(SERVO_EXIT_PIN,  GPIO.OUT)
 from leds import LedControl
 led = LedControl(ENTRY_LED_PINS, EXIT_LED_PINS)
 # ---------------- Configuration --------------------------------------------
+USE_PICAMERA = False
 CAMERA_INDEX = 0
 CAMERA_DEVICE = f"/dev/video{CAMERA_INDEX}"
 # WEB_PI_IP = "http://10.138.63.88" # old location
-# WEB_PI_IP = "http://192.168.1.16"    # current location
+# WEB_PI_IP = "http://192.168.1.17"    # current location
 # WEB_PI_IP =  "http://10.130.1.228"
-WEB_PI_IP =  "http://10.0.0.2"
+WEB_PI_IP =  "http://192.168.137.2"
 URL = f"{WEB_PI_IP}:5000"
 CROP_PERCENTAGE = 0.10
 ASPECT_MIN = 2.5
@@ -210,8 +218,8 @@ RE_PLATE = re.compile(r'^[A-Z]{3}\d{3}$')
 AUTO_IDLE_ENABLED   = False
 MAX_TIME_TO_IDLE    = 10.0  # seconds without a spot -> go IDLE
 # OCR confidences and rules
-MIN_SAMPLE_CONF = 40.0
-MIN_FINAL_CONF  = 50.0
+MIN_SAMPLE_CONF = 10.0
+MIN_FINAL_CONF  = 10.0
 MIN_FINAL_LEN   = (6, 6)
 MIN_FINAL_SAMPLES = 1
 # NEW: softer threshold for 6-char alias keys
@@ -398,6 +406,10 @@ def set_brightness(value):
     Methods: Clamp 0..255; subprocess.call().
     Creates: none.
     """
+    # Leave whe using PiCamera:
+    if USE_PICAMERA:
+        return value
+
     value = max(0, min(255, value))
     subprocess.call([
         "v4l2-ctl", f"--device={CAMERA_DEVICE}",
@@ -412,6 +424,10 @@ def set_contrast(value):
     Methods: Clamp 0..255; subprocess.call().
     Creates: none.
     """
+    # Leave whe using PiCamera:
+    if USE_PICAMERA:
+        return value
+
     value = max(0, min(255, value))
     subprocess.call([
         "v4l2-ctl", f"--device={CAMERA_DEVICE}",
@@ -426,6 +442,10 @@ def set_gain(value):
     Methods: Clamp 0..255; subprocess.call().
     Creates: none.
     """
+    # Leave whe using PiCamera:
+    if USE_PICAMERA:
+        return value
+
     value = max(0, min(255, value))
     subprocess.call([
         "v4l2-ctl", f"--device={CAMERA_DEVICE}",
@@ -441,6 +461,11 @@ def set_camera_ctrl(name, value):
     Methods: subprocess.call().
     Creates: none.
     """
+
+    # Leave whe using PiCamera:
+    if USE_PICAMERA:
+        return value
+
     subprocess.call([
         "v4l2-ctl",
         f"--device={CAMERA_DEVICE}",
@@ -480,6 +505,93 @@ def disable_camera_auto_controls():
 
     set_brightness(BRIGHTNESS)
     set_contrast(CONTRAST)
+
+def open_camera():
+    """
+    Function: open_camera
+    Purpose: Open either USB camera or Pi Camera.
+    """
+
+    if USE_PICAMERA:
+        if Picamera2 is None:
+            raise RuntimeError(
+                "Picamera2 module is not installed."
+            )
+
+        cam = Picamera2()
+
+        config = cam.create_preview_configuration(
+            main={
+                "size": CAMERA_RESOLUTION,
+                "format": "RGB888",
+            }
+        )
+
+        cam.configure(config)
+        cam.start()
+
+        cam.set_controls({
+            "AeEnable": False,
+            "AwbEnable": False,
+            "ExposureTime": 15000,
+            "AnalogueGain": 1.0,
+        })
+
+        return cam
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_WIDTH,
+        CAMERA_RESOLUTION[0]
+    )
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_HEIGHT,
+        CAMERA_RESOLUTION[1]
+    )
+
+    return cap
+
+def read_camera(camera):
+    """
+    Function: read_camera
+    Purpose: Read frame from selected backend.
+    """
+
+    if USE_PICAMERA:
+        frame = camera.capture_array()
+
+        frame = cv2.cvtColor(
+            frame,
+            cv2.COLOR_RGB2BGR
+        )
+
+        return True, frame
+
+    return camera.read()
+
+def close_camera(camera):
+    """
+    Function: close_camera
+    Purpose: Release camera resources.
+    """
+
+    if USE_PICAMERA:
+        camera.stop()
+    else:
+        camera.release()
+
+def configure_picamera(camera):
+    """
+    Function: configure_picamera
+    Purpose: Apply Pi Camera controls.
+    """
+
+    camera.set_controls({
+        "AeEnable": False,
+        "AwbEnable": False,
+    })
 
 def preprocess_roi(roi_bgr):
     """
@@ -1617,15 +1729,17 @@ def main():
         )
 
     cv2.namedWindow(MAIN_WINDOW)
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_RESOLUTION[0])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_RESOLUTION[1])
-    if not cap.isOpened():
+    cap = open_camera()
+
+    if not USE_PICAMERA and not cap.isOpened():
         print("ERROR: Cannot open USB camera!")
         GPIO.cleanup()
         return
     
-    disable_camera_auto_controls()
+    if USE_PICAMERA:
+        configure_picamera(cap)
+    else:
+        disable_camera_auto_controls()
 
     cv2.setMouseCallback(MAIN_WINDOW, on_mouse, None)
     next_read_ts = 0.0
@@ -1639,7 +1753,7 @@ def main():
 
     try:
         while True:
-            ok, frame = cap.read()
+            ok, frame = read_camera(cap)
             if not ok or frame is None:
                 time.sleep(0.02)
                 continue
@@ -1816,7 +1930,7 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted by Ctrl+C. Exiting...")
     finally:
-        cap.release()
+        close_camera(cap)
         cv2.destroyAllWindows()
         GPIO.cleanup()
 
