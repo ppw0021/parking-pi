@@ -739,12 +739,9 @@ def main():
     for side in ('enter', 'exit'):
         prev_button[side] = (GPIO.input(button_pin(side)) == GPIO.HIGH)
 
-    previous_enter_pressed = False
-    previous_exit_pressed = False
-
     try:
         while True:
-            ok, frame = read_camera(cap)
+            ok, frame = cap.read()
             if not ok or frame is None:
                 time.sleep(0.02)
                 continue
@@ -779,7 +776,7 @@ def main():
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
-        close_camera(cap)
+        cap.release()
         cv2.destroyAllWindows()
         led.all_off()
         GPIO.cleanup()
