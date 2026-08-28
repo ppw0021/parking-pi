@@ -49,6 +49,24 @@ Keys:  e = enter request   x = exit request   s = snapshot
        r = reload regions.json               q = quit
 '''
 
+# ==================== DEPLOY: EDIT THESE FIRST ========================
+# The two settings that change per machine / network, kept at the very
+# top so they are the first thing you touch on a new install.
+
+# DEMO_MODE = True  -> never contact the web server; open the gate on any
+#                      valid plate.  Use this to bench-test the motors
+#                      with no server running.
+# DEMO_MODE = False -> ask the web server below to allow / deny (normal).
+DEMO_MODE = True
+
+# Web server (source of truth).  "/enter/<plate>" / "/exit/<plate>" and
+# port 5000 are appended.  Past addresses:
+#   http://192.168.1.16    http://10.130.1.206
+WEB_PI_IP = "http://10.0.0.2"
+URL = f"{WEB_PI_IP}:5000"
+HTTP_TIMEOUT = 5.0
+# =====================================================================
+
 import json
 import os
 import time
@@ -68,17 +86,7 @@ except (ImportError, RuntimeError):   # not on a Pi - run with a no-op stub
 from leds import LedControl
 
 # ============================ Configuration ===============================
-
-# Demo switch: True = never contact the web server, always open the gate.
-DEMO_MODE = True
-
-# Web server (source of truth).  /enter/<plate> and /exit/<plate> are
-# appended.  Past addresses kept for convenience:
-# WEB_PI_IP = "http://192.168.1.16"
-# WEB_PI_IP = "http://10.130.1.206"
-WEB_PI_IP = "http://10.0.0.2"
-URL = f"{WEB_PI_IP}:5000"
-HTTP_TIMEOUT = 5.0
+# (DEMO_MODE and WEB_PI_IP live at the very top of this file.)
 
 # Camera.  On a PC the built-in webcam is usually index 0; override with
 # the GATE_CAMERA_INDEX env var without editing this file.
