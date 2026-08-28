@@ -116,18 +116,19 @@ REGIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "regions.json")
 LANE_SPLIT = 0.50                    # fallback lane split (fraction of width)
 
-# Inside each calibrated zone, find the single best WHITE rectangle - the
-# number plate.  It is white, roughly 2:1 to 3:1, and sits within
-# PLATE_MAX_TILT_DEG of level - the plate's expected orientation is
-# horizontal (cal.py's "rot180" only picks which way up OCR is tried
-# first, it does not change that the plate lies level in the zone).  A
-# candidate must sit inside PLATE_ASPECT +/- PLATE_ASPECT_TOL, cover
-# between PLATE_MIN_FILL and PLATE_MAX_FILL of the zone, be a near-solid
-# rectangle (PLATE_MIN_EXTENT / PLATE_MIN_SOLIDITY) and have its long
-# edge within PLATE_MAX_TILT_DEG of horizontal.  Of the survivors the
-# biggest / most rectangular / most 2.5:1 wins.  Run with GATE_DEBUG=1
-# (or press 'd') to see the white mask and, on the console, why
-# candidates were rejected.
+# Inside each calibrated zone, find the single best rectangular number
+# plate.  It is roughly 2:1 to 3:1, sits within PLATE_MAX_TILT_DEG of
+# level (cal.py's "rot180" only picks which way up OCR is tried first),
+# and its body is one flat colour - white with dark text OR dark with
+# white text: PLATE_POLARITY = "auto" tries both and keeps the better
+# rectangle, "white" / "black" pin it.  A candidate must sit inside
+# PLATE_ASPECT +/- PLATE_ASPECT_TOL, cover PLATE_MIN_FILL..PLATE_MAX_FILL
+# of the zone, be a near-solid slab (PLATE_MIN_EXTENT / PLATE_MIN_SOLIDITY)
+# and have its long edge within PLATE_MAX_TILT_DEG of horizontal.  Of the
+# survivors the biggest / most rectangular / most 2.5:1 wins.  Run with
+# GATE_DEBUG=1 (or press 'd') to see the slab mask(s) and, on the
+# console, why candidates were rejected.
+PLATE_POLARITY = os.environ.get("GATE_PLATE_POLARITY", "auto").lower()         # auto | white | black
 PLATE_ASPECT = float(os.environ.get("GATE_PLATE_ASPECT", "2.5"))               # long / short (US ~2.0, NZ ~2.8)
 PLATE_ASPECT_TOL = float(os.environ.get("GATE_PLATE_ASPECT_TOL", "0.50"))      # +/- fraction -> ~[1.25, 3.75]
 PLATE_MIN_FILL = float(os.environ.get("GATE_PLATE_MIN_FILL", "0.02"))          # min rect / zone area
@@ -138,8 +139,9 @@ PLATE_MIN_SOLIDITY = float(os.environ.get("GATE_PLATE_MIN_SOLIDITY", "0.80"))  #
 # orientation.  45 is the hard ceiling: past 45 deg a 2:1 rectangle is
 # indistinguishable from the same rectangle stood on its short end.
 PLATE_MAX_TILT_DEG = min(float(os.environ.get("GATE_PLATE_MAX_TILT_DEG", "45")), 45.0)
-PLATE_WHITE_MAX_SAT = int(os.environ.get("GATE_PLATE_WHITE_MAX_SAT", "120"))   # HSV S ceiling for "white" (255 disables)
-PLATE_WHITE_VAL_MIN = int(os.environ.get("GATE_PLATE_WHITE_VAL_MIN", "100"))   # HSV V floor: never call a dark zone white
+PLATE_BODY_MAX_SAT = int(os.environ.get("GATE_PLATE_BODY_MAX_SAT", "120"))     # HSV S ceiling for the plate body (255 disables)
+PLATE_WHITE_VAL_MIN = int(os.environ.get("GATE_PLATE_WHITE_VAL_MIN", "100"))   # V floor: never call a dark zone a white plate
+PLATE_DARK_VAL_MAX = int(os.environ.get("GATE_PLATE_DARK_VAL_MAX", "150"))     # V ceiling: never call a bright zone a black plate
 PLATE_WARP_H = 200
 PLATE_WARP_W = int(round(PLATE_WARP_H * PLATE_ASPECT))
 
@@ -357,21 +359,29 @@ def _orient_quad(pts):
     return np.array([tl, tr, br, bl], dtype="float32")
 
 
-def _white_mask(zone):
-    """Binary mask of the bright, not-too-saturated (white) pixels in a
-    zone, with the black characters and any border nicks sealed into one
-    slab.  Threshold = Otsu on a CLAHE-equalised value channel, but never
-    below PLATE_WHITE_VAL_MIN so a dark zone can't turn all-white.  The
-    saturation ceiling drops obviously coloured regions (set
-    GATE_PLATE_WHITE_MAX_SAT=255 to disable it for a pure B/W rig)."""
+def _slab_mask(zone, dark):
+    """Binary mask of the plate BODY as one solid slab, with the text and
+    border nicks sealed shut.
+
+      dark=False -> bright body (white plate, dark text)
+      dark=True  -> dark body   (black plate, white text)
+
+    Threshold is Otsu on a CLAHE-equalised value channel, clamped so a
+    flat zone can't turn fully on (>= PLATE_WHITE_VAL_MIN for bright,
+    <= PLATE_DARK_VAL_MAX for dark).  The saturation ceiling drops
+    obviously coloured regions (set GATE_PLATE_BODY_MAX_SAT=255 to
+    disable it)."""
     hsv = cv2.cvtColor(zone, cv2.COLOR_BGR2HSV)
     sat, val = hsv[:, :, 1], hsv[:, :, 2]
     val = cv2.createCLAHE(2.0, (8, 8)).apply(val)
     otsu, _ = cv2.threshold(val, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    v_thr = max(otsu, float(PLATE_WHITE_VAL_MIN))
-    mask = ((val >= v_thr) & (sat <= PLATE_WHITE_MAX_SAT)).astype(np.uint8) * 255
-    # close first (bridge the black glyphs / border gaps), then a small
-    # open to shave speckle without eating a thin plate border
+    if dark:
+        body = val <= min(otsu, float(PLATE_DARK_VAL_MAX))
+    else:
+        body = val >= max(otsu, float(PLATE_WHITE_VAL_MIN))
+    mask = (body & (sat <= PLATE_BODY_MAX_SAT)).astype(np.uint8) * 255
+    # close first (bridge the text / border gaps), then a small open to
+    # shave speckle without eating a thin plate border
     mask = cv2.morphologyEx(
         mask, cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=2)
@@ -408,20 +418,12 @@ def _rect_tilt_deg(box):
 
 _last_find_diag = ""    # dedupe the DEBUG "why no plate" line
 
+_POLARITIES = {'white': (False,), 'black': (True,), 'auto': (False, True)}
 
-def find_plate(zone):
-    """Find the best white ~2.5:1 rectangle (the number plate) in a zone
-    and rectify it.  Return (rectified_bgr, quad_in_zone_coords, mask), or
-    (None, None, mask) when nothing passes the size / aspect /
-    rectangularity / tilt gates.  With GATE_DEBUG on, logs which gate the
-    candidates fell at (deduped)."""
-    global _last_find_diag
-    h, w = zone.shape[:2]
-    zone_area = float(w * h)
-    mask = _white_mask(zone)
 
-    lo = PLATE_ASPECT * (1.0 - PLATE_ASPECT_TOL)
-    hi = PLATE_ASPECT * (1.0 + PLATE_ASPECT_TOL)
+def _scan_mask(mask, zone_area, lo, hi):
+    """Walk one slab mask's external contours and return
+    (best_contour, best_score, rejects_Counter)."""
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
     rejects = Counter()
@@ -456,25 +458,54 @@ def find_plate(zone):
                  * (1.0 - min(abs(ratio - PLATE_ASPECT) / PLATE_ASPECT, 1.0)))
         if score > best_score:
             best_c, best_score = c, score
+    return best_c, best_score, rejects
 
-    if best_c is None:
+
+def find_plate(zone):
+    """Find the best ~2.5:1 rectangular plate in a zone and rectify it.
+    Depending on PLATE_POLARITY, look for a bright slab (white plate),
+    a dark slab (black plate), or both and keep whichever rectangle
+    scores higher.  Return (rectified_bgr, quad_in_zone_coords, masks),
+    or (None, None, masks) when nothing passes the size / aspect /
+    rectangularity / tilt gates.  `masks` is the slab mask(s) tried, for
+    the debug view.  With GATE_DEBUG on, logs which gate candidates fell
+    at (deduped)."""
+    global _last_find_diag
+    h, w = zone.shape[:2]
+    zone_area = float(w * h)
+    lo = PLATE_ASPECT * (1.0 - PLATE_ASPECT_TOL)
+    hi = PLATE_ASPECT * (1.0 + PLATE_ASPECT_TOL)
+
+    masks, best = [], None          # best = (score, contour, polarity)
+    all_rejects = Counter()
+    for dark in _POLARITIES.get(PLATE_POLARITY, _POLARITIES['auto']):
+        mask = _slab_mask(zone, dark)
+        masks.append(mask)
+        c, score, rejects = _scan_mask(mask, zone_area, lo, hi)
+        all_rejects.update(rejects)
+        if c is not None and (best is None or score > best[0]):
+            best = (score, c, dark)
+
+    if best is None:
         if DEBUG:
-            diag = (f"{len(contours)} contours, "
-                    + (", ".join(f"{k} x{v}" for k, v in rejects.most_common())
-                       or "none over the size floor"))
+            diag = ", ".join(f"{k} x{v}" for k, v in all_rejects.most_common()) \
+                or "no candidates over the size floor"
             if diag != _last_find_diag:
                 _last_find_diag = diag
-                print(f"[find_plate] no plate - {diag}")
-        return None, None, mask
+                print(f"[find_plate] no plate ({PLATE_POLARITY}) - {diag}")
+        return None, None, masks
 
     _last_find_diag = ""
+    _, best_c, dark = best
+    if DEBUG:
+        print(f"[find_plate] plate on {'black' if dark else 'white'} slab")
     quad = _orient_quad(_quad_from_contour(best_c))
     dst = np.array([[0, 0], [PLATE_WARP_W - 1, 0],
                     [PLATE_WARP_W - 1, PLATE_WARP_H - 1],
                     [0, PLATE_WARP_H - 1]], dtype="float32")
     warp = cv2.warpPerspective(zone, cv2.getPerspectiveTransform(quad, dst),
                                (PLATE_WARP_W, PLATE_WARP_H))
-    return warp, quad, mask
+    return warp, quad, masks
 
 
 def _plate_cfg(psm):
@@ -574,14 +605,14 @@ def find_and_read(frame, side):
     zone, origin = zone_of(frame, side)
     if zone is None:
         return None
-    plate, quad, mask = find_plate(zone)
+    plate, quad, masks = find_plate(zone)
     if quad is None:                          # rectangle not there yet
         last_quads.pop(side, None)
-        _set_debug_strip([to_ocr_gray(zone), mask])   # zone | white mask
+        _set_debug_strip([to_ocr_gray(zone), *masks])   # zone | slab mask(s)
         return None
     last_quads[side] = quad + np.asarray(origin, dtype="float32")
     text, vis = ocr_plate(plate, REGIONS[side]['rot180'])
-    _set_debug_strip([mask, vis])                     # white mask | OCR input
+    _set_debug_strip([*masks, vis])                     # slab mask(s) | OCR input
     return coerce_format(text) if text else ""
 
 
